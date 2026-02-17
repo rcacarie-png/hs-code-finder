@@ -2,16 +2,12 @@ import io
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Any
 
 import pandas as pd
 import streamlit as st
 from rapidfuzz import process, fuzz
-
-# Optional (web lookup)
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
 
 
 # ----------------------------
@@ -21,24 +17,21 @@ def normalize_text(s: Optional[str]) -> str:
     if s is None:
         return ""
     s = str(s).strip().upper()
-    # remove accents
     s = "".join(
         c for c in unicodedata.normalize("NFD", s)
         if unicodedata.category(c) != "Mn"
     )
-    # keep alnum + spaces
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Find a column by fuzzy header matching (case-insensitive)."""
-    cols = {c.lower().strip(): c for c in df.columns}
+    cols = {str(c).lower().strip(): c for c in df.columns}
     for cand in candidates:
-        if cand.lower() in cols:
-            return cols[cand.lower()]
-    # fallback: contains
+        key = cand.lower().strip()
+        if key in cols:
+            return cols[key]
     for c in df.columns:
         cl = str(c).lower()
         for cand in candidates:
@@ -48,7 +41,6 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 
 
 def find_hs_col(df: pd.DataFrame) -> Optional[str]:
-    # Typical headers: "HS CODE", "HS COD", "HS Code"
     for c in df.columns:
         cl = str(c).lower().replace(" ", "")
         if "hs" in cl and "cod" in cl:
@@ -56,45 +48,103 @@ def find_hs_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-# ----------------------------
-# Web lookup (best-effort)
-# ----------------------------
-HS_PATTERN = re.compile(r"\b\d{4}(\.\d{2}){1,3}\b|\b\d{6,10}\b")
+def safe_str(x: Any) -> str:
+    s = "" if x is None else str(x)
+    s = s.strip()
+    return "" if s.lower() == "nan" else s
 
-def lookup_hs_web_best_effort(query: str, timeout: int = 12) -> Optional[str]:
+
+# ----------------------------
+# TariffDouanier API lookup
+# ----------------------------
+def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+
+    if api_data is None:
+        return candidates
+
+    if isinstance(api_data, dict):
+        for key in ["items", "results", "data", "suggestions"]:
+            if key in api_data and isinstance(api_data[key], list):
+                api_data = api_data[key]
+                break
+
+    if not isinstance(api_data, list):
+        return candidates
+
+    for item in api_data:
+        if not isinstance(item, dict):
+            continue
+
+        code = (
+            item.get("cn")
+            or item.get("code")
+            or item.get("tariffNumber")
+            or item.get("number")
+            or item.get("value")
+            or item.get("id")
+        )
+
+        label = (
+            item.get("label")
+            or item.get("text")
+            or item.get("description")
+            or item.get("desc")
+            or item.get("name")
+            or ""
+        )
+
+        if code:
+            code_str = str(code).strip()
+            code_digits = re.sub(r"\D", "", code_str)
+            if len(code_digits) >= 6:
+                candidates.append((code_digits, str(label).strip()))
+            else:
+                if code_str.isdigit() and len(code_str) >= 6:
+                    candidates.append((code_str, str(label).strip()))
+
+    return candidates
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr") -> Optional[Tuple[str, str]]:
     """
-    Best-effort scrape.
-    IMPORTANT: you may need to adjust the search URL depending on tarifdouanier.eu routing.
+    Official API:
+      - V1: /api/v1/cnSuggest?term=...&lang=fr&year=2024
+      - V2: /api/v2/cnSuggest?term=...&lang=fr   (semantic)
     """
-    q = normalize_text(query)
-    if not q:
+    term_n = normalize_text(term)
+    if not term_n:
         return None
 
-    # Try a plausible search endpoint (may need adjustment).
-    # If it fails, we still won't crash the app.
-    search_url = f"https://www.tarifdouanier.eu/recherche?query={quote_plus(q)}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
 
     try:
-        r = requests.get(search_url, headers=headers, timeout=timeout)
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-
-        # pick first plausible HS code-ish token
-        m = HS_PATTERN.search(text)
-        if not m:
-            return None
-
-        hs = m.group(0)
-        # Normalize: keep digits only if needed
-        hs_digits = re.sub(r"\D", "", hs)
-        if len(hs_digits) >= 6:
-            return hs_digits
-        return hs
+        url_v1 = "https://www.tarifdouanier.eu/api/v1/cnSuggest"
+        r = requests.get(url_v1, params={"term": term_n, "lang": lang, "year": str(year)}, headers=headers, timeout=15)
+        if r.ok:
+            data = r.json()
+            cands = _extract_cn_candidates(data)
+            if cands:
+                return cands[0]
     except Exception:
-        return None
+        pass
+
+    try:
+        url_v2 = "https://www.tarifdouanier.eu/api/v2/cnSuggest"
+        r = requests.get(url_v2, params={"term": term_n, "lang": lang}, headers=headers, timeout=15)
+        if r.ok:
+            data = r.json()
+            cands = _extract_cn_candidates(data)
+            if cands:
+                return cands[0]
+    except Exception:
+        pass
+
+    return None
 
 
 # ----------------------------
@@ -103,136 +153,240 @@ def lookup_hs_web_best_effort(query: str, timeout: int = 12) -> Optional[str]:
 @dataclass
 class MatchResult:
     hs_code: Optional[str]
-    match_type: str          # EXACT / FUZZY / WEB / NOT_FOUND / FOUND_NO_HS_IN_BDD
-    source: str              # BDD / WEB / NONE
+    match_type: str   # EXACT / FUZZY / WEB / NOT_FOUND / FOUND_NO_HS_IN_BDD / REVIEW
+    source: str       # BDD / WEB_API / NONE / INPUT
     detail: str
 
 
 @st.cache_data(show_spinner=False)
-def load_bdd(bdd_file_bytes: bytes) -> pd.DataFrame:
-    # Read first sheet by default
+def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
+    """
+    Load ONE BDD workbook (first sheet), normalize key columns and tag with source label.
+    """
     df = pd.read_excel(io.BytesIO(bdd_file_bytes), sheet_name=0, engine="openpyxl")
-    # Expected columns in your BDD: FOURNISSEUR, CODE ARTICLE, Description, HS CODE, Origine fabrication
-    # We'll normalize names a bit
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Create normalized helper columns
-    code_col = find_col(df, ["CODE ARTICLE", "CODE ARTICLE ", "CODE_ARTICLE", "ARTICLE"])
-    desc_col = find_col(df, ["Description", "DESIGNATION", "LIBELLE"])
-    hs_col = find_col(df, ["HS CODE", "HS", "HS_CODE"])
+    code_col = find_col(df, ["CODE ARTICLE", "CODE_ARTICLE", "ARTICLE", "Code article", "Article"])
+    desc_col = find_col(df, ["Description", "DESIGNATION", "LIBELLE", "Libellé", "Libelle"])
+    hs_col = find_col(df, ["HS CODE", "HS", "HS_CODE", "HS COD", "HSCODE"])
+    supp_col = find_col(df, ["Fournisseur", "Supplier", "FOURNISSEUR"])
 
-    if code_col is None:
-        df["_CODE_N"] = ""
-    else:
-        df["_CODE_N"] = df[code_col].astype(str).map(normalize_text)
+    df["_CODE_N"] = df[code_col].astype(str).map(normalize_text) if code_col else ""
+    df["_DESC_N"] = df[desc_col].astype(str).map(normalize_text) if desc_col else ""
+    df["_SUPP_N"] = df[supp_col].astype(str).map(normalize_text) if supp_col else ""
+    df["_HS"] = df[hs_col] if hs_col else ""
 
-    if desc_col is None:
-        df["_DESC_N"] = ""
-    else:
-        df["_DESC_N"] = df[desc_col].astype(str).map(normalize_text)
-
-    if hs_col is None:
-        df["_HS"] = None
-    else:
-        df["_HS"] = df[hs_col]
-
-    # Keep only rows that have at least something
+    df["_SRC_FILE"] = file_label  # track which truth source produced the match
     df = df.fillna("")
     return df
 
 
-def build_bdd_indexes(bdd: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
-    # code -> hs (prefer first non-empty)
-    code_to_hs: Dict[str, str] = {}
-    desc_to_hs: Dict[str, str] = {}
+def load_and_merge_bdds(bdd1_bytes: bytes, bdd2_bytes: Optional[bytes], bdd2_enabled: bool) -> pd.DataFrame:
+    """
+    Merge 1 or 2 BDD sources into one dataset, keeping source label.
+    """
+    df1 = load_bdd_single(bdd1_bytes, file_label="BDD_1")
+    if bdd2_enabled and bdd2_bytes:
+        df2 = load_bdd_single(bdd2_bytes, file_label="BDD_2")
+        # concat, keep all
+        merged = pd.concat([df1, df2], ignore_index=True)
+        return merged
+    return df1
+
+
+def build_bdd_indexes(bdd: pd.DataFrame):
+    """
+    Build global + supplier-scoped indexes:
+      - code_to_best: code -> (hs, src_file)
+      - desc_to_best: desc -> (hs, src_file)
+      - desc_list: list(desc)
+      - per supplier versions same shape
+    """
+    code_to_best: Dict[str, Tuple[str, str]] = {}
+    desc_to_best: Dict[str, Tuple[str, str]] = {}
     desc_list: List[str] = []
 
-    for _, row in bdd.iterrows():
-        code = row.get("_CODE_N", "")
-        desc = row.get("_DESC_N", "")
-        hs = row.get("_HS", "")
-        hs_str = str(hs).strip()
-        if hs_str == "" or hs_str.lower() == "nan":
-            hs_str = ""
+    supp_code_to_best: Dict[str, Dict[str, Tuple[str, str]]] = {}
+    supp_desc_to_best: Dict[str, Dict[str, Tuple[str, str]]] = {}
+    supp_desc_list: Dict[str, List[str]] = {}
 
-        if code and code not in code_to_hs and hs_str:
-            code_to_hs[code] = hs_str
+    # Preference rule: if duplicates exist, keep first non-empty HS encountered.
+    for _, row in bdd.iterrows():
+        code = safe_str(row.get("_CODE_N", ""))
+        desc = safe_str(row.get("_DESC_N", ""))
+        supp = safe_str(row.get("_SUPP_N", ""))
+        hs = safe_str(row.get("_HS", ""))
+        src_file = safe_str(row.get("_SRC_FILE", "BDD"))
+
+        if code and hs and code not in code_to_best:
+            code_to_best[code] = (hs, src_file)
 
         if desc:
             desc_list.append(desc)
-            if desc not in desc_to_hs and hs_str:
-                desc_to_hs[desc] = hs_str
+            if hs and desc not in desc_to_best:
+                desc_to_best[desc] = (hs, src_file)
 
-    return code_to_hs, desc_to_hs, desc_list
+        if supp:
+            supp_code_to_best.setdefault(supp, {})
+            supp_desc_to_best.setdefault(supp, {})
+            supp_desc_list.setdefault(supp, [])
+
+            if code and hs and code not in supp_code_to_best[supp]:
+                supp_code_to_best[supp][code] = (hs, src_file)
+
+            if desc:
+                supp_desc_list[supp].append(desc)
+                if hs and desc not in supp_desc_to_best[supp]:
+                    supp_desc_to_best[supp][desc] = (hs, src_file)
+
+    return code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list
+
+
+def fuzzy_best_two(query: str, choices: List[str]):
+    if not query or not choices:
+        return None, None
+
+    results = process.extract(
+        query,
+        choices,
+        scorer=fuzz.WRatio,
+        limit=2
+    )
+    if not results:
+        return None, None
+
+    best = results[0]
+    second = results[1] if len(results) > 1 else None
+
+    best_tuple = (best[0], int(best[1]))
+    second_tuple = (second[0], int(second[1])) if second else None
+    return best_tuple, second_tuple
 
 
 def match_row(
     article_code: str,
     libelle: str,
-    code_to_hs: Dict[str, str],
-    desc_to_hs: Dict[str, str],
-    desc_list: List[str],
-    fuzzy_threshold: int,
-    enable_web: bool
+    fournisseur: str,
+    indexes,
+    auto_fill_threshold: int,
+    review_threshold: int,
+    margin_top2: int,
+    enable_web: bool,
+    web_year: int
 ) -> MatchResult:
+    code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list = indexes
+
     code_n = normalize_text(article_code)
     lib_n = normalize_text(libelle)
+    supp_n = normalize_text(fournisseur)
 
-    # 1) Exact by code
+    scoped_code = supp_code_to_best.get(supp_n) if supp_n else None
+    scoped_desc = supp_desc_to_best.get(supp_n) if supp_n else None
+    scoped_list = supp_desc_list.get(supp_n) if supp_n else None
+
+    # 1) Exact by code (supplier first)
     if code_n:
-        hs = code_to_hs.get(code_n)
-        if hs:
-            return MatchResult(hs, "EXACT", "BDD", "CODE ARTICLE exact")
-        # code found in BDD but HS empty is hard to know without extra index;
-        # we still try description routes next.
+        if scoped_code:
+            best = scoped_code.get(code_n)
+            if best:
+                hs, srcfile = best
+                return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "CODE ARTICLE exact (supplier-scoped)")
+        best = code_to_best.get(code_n)
+        if best:
+            hs, srcfile = best
+            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "CODE ARTICLE exact")
 
-    # 2) Exact by normalized description
-    if lib_n and lib_n in desc_to_hs:
-        return MatchResult(desc_to_hs[lib_n], "EXACT", "BDD", "Description exact")
+    # 2) Exact by description
+    if lib_n:
+        if scoped_desc and lib_n in scoped_desc:
+            hs, srcfile = scoped_desc[lib_n]
+            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "Description exact (supplier-scoped)")
+        if lib_n in desc_to_best:
+            hs, srcfile = desc_to_best[lib_n]
+            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "Description exact")
 
     # 3) Fuzzy
-    if lib_n and desc_list:
-        best = process.extractOne(
-            lib_n,
-            desc_list,
-            scorer=fuzz.token_sort_ratio
-        )
+    if lib_n:
+        choices = None
+        choices_source = "global"
+        if scoped_list and len(scoped_list) >= 25:
+            choices = scoped_list
+            choices_source = "supplier-scoped"
+        else:
+            choices = desc_list
+
+        best, second = fuzzy_best_two(lib_n, choices)
         if best:
-            match_desc, score, _ = best
-            if score >= fuzzy_threshold:
-                hs = desc_to_hs.get(match_desc)
-                if hs:
+            best_desc, best_score = best
+            second_score = second[1] if second else 0
+            margin = best_score - second_score
+
+            if best_score >= auto_fill_threshold and margin >= margin_top2:
+                # lookup HS for that matched desc
+                hs_src = None
+                if choices_source == "supplier-scoped" and scoped_desc:
+                    hs_src = scoped_desc.get(best_desc)
+                if not hs_src:
+                    hs_src = desc_to_best.get(best_desc)
+
+                if hs_src:
+                    hs, srcfile = hs_src
                     return MatchResult(
                         hs,
                         "FUZZY",
-                        "BDD",
-                        f'fuzzy score={score}; matched="{match_desc[:80]}"'
+                        f"BDD:{srcfile}",
+                        f'fuzzy({choices_source}) score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
                 else:
-                    # matched row exists but HS missing in BDD
+                    # matched but HS missing
                     if enable_web:
-                        hs_web = lookup_hs_web_best_effort(libelle)
-                        if hs_web:
-                            return MatchResult(hs_web, "WEB", "WEB", f"web from fuzzy-matched item; score={score}")
-                    return MatchResult(None, "FOUND_NO_HS_IN_BDD", "BDD", f"fuzzy matched but HS missing; score={score}")
+                        web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
+                        if web:
+                            hs_web, label = web
+                            return MatchResult(
+                                hs_web,
+                                "WEB",
+                                "WEB_API",
+                                f'web(api) after fuzzy HS-missing; fuzzy_score={best_score}; "{label[:120]}"'
+                            )
+                    return MatchResult(
+                        None,
+                        "FOUND_NO_HS_IN_BDD",
+                        "BDD",
+                        f'fuzzy matched but HS missing; score={best_score}; matched="{best_desc[:120]}"'
+                    )
+
+            if best_score >= review_threshold:
+                return MatchResult(
+                    None,
+                    "REVIEW",
+                    "BDD",
+                    f'candidate="{best_desc[:120]}"; score={best_score}; top2_margin={margin}; (not auto-filled)'
+                )
 
     # 4) Web fallback
     if enable_web and libelle:
-        hs_web = lookup_hs_web_best_effort(libelle)
-        if hs_web:
-            return MatchResult(hs_web, "WEB", "WEB", "web lookup")
+        web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
+        if web:
+            hs_web, label = web
+            return MatchResult(hs_web, "WEB", "WEB_API", f'web(api) "{label[:120]}"')
 
     return MatchResult(None, "NOT_FOUND", "NONE", "no match")
 
 
 def process_workbook(
     input_bytes: bytes,
-    bdd_bytes: bytes,
-    fuzzy_threshold: int,
-    enable_web: bool
+    bdd1_bytes: bytes,
+    bdd2_bytes: Optional[bytes],
+    bdd2_enabled: bool,
+    auto_fill_threshold: int,
+    review_threshold: int,
+    margin_top2: int,
+    enable_web: bool,
+    web_year: int
 ) -> bytes:
-    bdd = load_bdd(bdd_bytes)
-    code_to_hs, desc_to_hs, desc_list = build_bdd_indexes(bdd)
+    bdd = load_and_merge_bdds(bdd1_bytes, bdd2_bytes, bdd2_enabled)
+    indexes = build_bdd_indexes(bdd)
 
     xls = pd.ExcelFile(io.BytesIO(input_bytes), engine="openpyxl")
     out_buffer = io.BytesIO()
@@ -243,64 +397,56 @@ def process_workbook(
 
             hs_col = find_hs_col(df)
             if hs_col is None:
-                # write untouched
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
                 continue
 
-            # identify useful columns
             article_col = find_col(df, ["Article", "CODE ARTICLE", "Code article"])
             lib_col = find_col(df, ["Libellé à imprimer", "Libelle a imprimer", "Description", "Libellé", "Libelle"])
+            supp_col = find_col(df, ["Fournisseur", "Supplier", "FOURNISSEUR"])
 
-            if lib_col is None:
-                # If no text column, we still try code-only
-                lib_col = None
-
-            # Ensure metadata columns exist right after HS column
-            # We'll append then reorder to place them immediately after hs_col.
             meta_cols = ["HS_MATCH_TYPE", "HS_SOURCE", "HS_MATCH_DETAIL"]
             for mc in meta_cols:
                 if mc not in df.columns:
                     df[mc] = ""
 
-            # Fill
             for i in range(len(df)):
-                current_hs = str(df.at[i, hs_col]).strip() if i in df.index else ""
-                if current_hs and current_hs.lower() != "nan":
-                    # Already filled: keep it, but mark as already present
+                current_hs = safe_str(df.at[i, hs_col]) if i in df.index else ""
+                if current_hs:
                     df.at[i, "HS_MATCH_TYPE"] = "ALREADY_PRESENT"
                     df.at[i, "HS_SOURCE"] = "INPUT"
                     df.at[i, "HS_MATCH_DETAIL"] = "HS already filled in input file"
                     continue
 
-                article_val = str(df.at[i, article_col]).strip() if article_col else ""
-                lib_val = str(df.at[i, lib_col]).strip() if lib_col else ""
+                article_val = safe_str(df.at[i, article_col]) if article_col else ""
+                lib_val = safe_str(df.at[i, lib_col]) if lib_col else ""
+                supp_val = safe_str(df.at[i, supp_col]) if supp_col else ""
 
                 res = match_row(
                     article_code=article_val,
                     libelle=lib_val,
-                    code_to_hs=code_to_hs,
-                    desc_to_hs=desc_to_hs,
-                    desc_list=desc_list,
-                    fuzzy_threshold=fuzzy_threshold,
-                    enable_web=enable_web
+                    fournisseur=supp_val,
+                    indexes=indexes,
+                    auto_fill_threshold=auto_fill_threshold,
+                    review_threshold=review_threshold,
+                    margin_top2=margin_top2,
+                    enable_web=enable_web,
+                    web_year=web_year
                 )
 
-                hscode = res.hs_code
+                hscode = safe_str(res.hs_code)
                 if hscode:
                     df.at[i, hs_col] = hscode
-
 
                 df.at[i, "HS_MATCH_TYPE"] = res.match_type
                 df.at[i, "HS_SOURCE"] = res.source
                 df.at[i, "HS_MATCH_DETAIL"] = res.detail
- 
-            # Reorder columns: insert meta cols right after hs_col
+
+            # Reorder: insert meta cols right after HS col
             cols = list(df.columns)
-            # remove meta cols from current order
             for mc in meta_cols:
                 cols.remove(mc)
             hs_idx = cols.index(hs_col)
-            new_cols = cols[:hs_idx+1] + meta_cols + cols[hs_idx+1:]
+            new_cols = cols[:hs_idx + 1] + meta_cols + cols[hs_idx + 1:]
             df = df[new_cols]
 
             df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -312,40 +458,59 @@ def process_workbook(
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="HS Code Autofill", layout="wide")
-
-st.title("HS Code Autofill (BDD + fuzzy + option web)")
+st.set_page_config(page_title="HS Code Finder", layout="wide")
+st.title("HS Code Finder — 2 BDD + fuzzy (anti-faux positifs) + web (tarifdouanier.eu API)")
 
 st.markdown(
     """
-**Objectif :** uploader un Excel avec une colonne HS Code vide → enrichir automatiquement depuis la BDD historique,  
-avec un statut de matching + source.
+**But :** uploader un Excel avec une colonne HS Code vide → enrichir automatiquement depuis **1 ou 2 BDD** (sources de vérité).  
+Améliorations :
+- fuzzy plus strict + “REVIEW” (réduit les faux positifs)
+- option web via API officielle TarifDouanier
 """
 )
 
-col1, col2 = st.columns(2)
-
+col1, col2, col3 = st.columns(3)
 with col1:
     input_file = st.file_uploader("1) Excel à compléter (multi-onglets OK)", type=["xlsx", "xlsm"])
-
 with col2:
-    bdd_file = st.file_uploader("2) BDD source de vérité (xlsm/xlsx)", type=["xlsx", "xlsm"])
+    bdd1_file = st.file_uploader("2) BDD source de vérité #1 (xlsm/xlsx)", type=["xlsx", "xlsm"])
+with col3:
+    bdd2_file = st.file_uploader("3) BDD source de vérité #2 (optionnel)", type=["xlsx", "xlsm"])
+bdd2_enabled = bdd2_file is not None
 
 st.divider()
 
-fuzzy_threshold = st.slider("Seuil fuzzy (token_sort_ratio)", min_value=60, max_value=98, value=90, step=1)
-enable_web = st.checkbox("Activer la recherche web (plus lent, best-effort)", value=False)
+c1, c2, c3 = st.columns(3)
+with c1:
+    auto_fill_threshold = st.slider("Seuil AUTO-FILL (fuzzy)", 80, 99, 94, 1)
+with c2:
+    review_threshold = st.slider("Seuil REVIEW (suggestion sans remplir)", 60, 98, 88, 1)
+with c3:
+    margin_top2 = st.slider("Marge Top1 vs Top2 (anti-rouge)", 0, 20, 6, 1)
 
-if input_file and bdd_file:
-    st.success("Fichiers chargés. Tu peux lancer l’enrichissement.")
+enable_web = st.checkbox("Activer le web (API tarifdouanier.eu)", value=True)
+web_year = st.selectbox("Année tarif", options=[2024, 2025, 2026], index=0)
 
+st.caption(
+    "Astuce : si tu as du rouge → monte AUTO-FILL (95-96) et/ou augmente la marge Top1-Top2 (8-10). "
+    "Les cas 'REVIEW' sont des suggestions sans remplissage."
+)
+
+if input_file and bdd1_file:
+    st.success("Fichiers chargés. Lance l’enrichissement.")
     if st.button("🚀 Enrichir et générer l’Excel", type="primary"):
-        with st.spinner("Traitement en cours…"):
+        with st.spinner("Traitement…"):
             out_bytes = process_workbook(
                 input_bytes=input_file.read(),
-                bdd_bytes=bdd_file.read(),
-                fuzzy_threshold=fuzzy_threshold,
-                enable_web=enable_web
+                bdd1_bytes=bdd1_file.read(),
+                bdd2_bytes=bdd2_file.read() if bdd2_enabled else None,
+                bdd2_enabled=bdd2_enabled,
+                auto_fill_threshold=auto_fill_threshold,
+                review_threshold=review_threshold,
+                margin_top2=margin_top2,
+                enable_web=enable_web,
+                web_year=web_year
             )
 
         st.download_button(
@@ -355,4 +520,4 @@ if input_file and bdd_file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
-    st.info("Charge l’Excel à compléter + la BDD, puis lance le traitement.")
+    st.info("Charge l’Excel à compléter + au moins la BDD #1.")
