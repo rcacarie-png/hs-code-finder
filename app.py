@@ -55,7 +55,7 @@ def safe_str(x: Any) -> str:
 
 
 # ----------------------------
-# WEB sanity check (Option B)
+# WEB sanity check (anti-absurde)
 # ----------------------------
 def is_food_like_label(label: str) -> bool:
     t = normalize_text(label)
@@ -74,9 +74,8 @@ def hs_chapter(hs: str) -> str:
 
 def block_web_if_obviously_wrong(label: str, hs: str) -> bool:
     """
-    Block only the worst obvious cases:
+    Block only obvious wrong suggestions:
     - If suggested HS is in food chapters (01..24) but label doesn't look like food.
-    This prevents: "table basse" -> eggs.
     """
     ch = hs_chapter(hs)
     if ch and ("01" <= ch <= "24") and (not is_food_like_label(label)):
@@ -85,16 +84,10 @@ def block_web_if_obviously_wrong(label: str, hs: str) -> bool:
 
 
 # ----------------------------
-# TariffDouanier API lookup (WEB)
-# IMPORTANT: WEB is SUGGESTION ONLY (never auto-fill)
+# TarifDouanier API lookup (WEB)
 # ----------------------------
 def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
-    """
-    Return list of (code, label/desc) from unknown JSON shapes.
-    Best-effort schema resilience.
-    """
     candidates: List[Tuple[str, str]] = []
-
     if api_data is None:
         return candidates
 
@@ -132,24 +125,16 @@ def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
         if code:
             code_str = str(code).strip()
             code_digits = re.sub(r"\D", "", code_str)
-            # We keep 6 digits for your use-case
             if len(code_digits) >= 6:
                 candidates.append((code_digits[:6], str(label).strip()))
             else:
                 if code_str.isdigit() and len(code_str) >= 6:
                     candidates.append((code_str[:6], str(label).strip()))
-
     return candidates
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr") -> Optional[Tuple[str, str]]:
-    """
-    Official API:
-      - V1: /api/v1/cnSuggest?term=...&lang=fr&year=2024
-      - V2: /api/v2/cnSuggest?term=...&lang=fr
-    Return first suggestion (hs_code_6digits, label) or None.
-    """
     term_n = normalize_text(term)
     if not term_n:
         return None
@@ -159,7 +144,6 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
         "Accept": "application/json,text/plain,*/*",
     }
 
-    # V1 (year supported)
     try:
         url_v1 = "https://www.tarifdouanier.eu/api/v1/cnSuggest"
         r = requests.get(url_v1, params={"term": term_n, "lang": lang, "year": str(year)}, headers=headers, timeout=15)
@@ -171,7 +155,6 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
     except Exception:
         pass
 
-    # V2 fallback
     try:
         url_v2 = "https://www.tarifdouanier.eu/api/v2/cnSuggest"
         r = requests.get(url_v2, params={"term": term_n, "lang": lang}, headers=headers, timeout=15)
@@ -191,17 +174,14 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
 # ----------------------------
 @dataclass
 class MatchResult:
-    hs_code: Optional[str]   # Only set when we REALLY fill HS CODE
+    hs_code: Optional[str]   # For EXACT/FUZZY: filled. For REVIEW/WEB: suggested HS (now also written in HS column).
     match_type: str          # EXACT / FUZZY / REVIEW / WEB_REVIEW / WEB_BLOCKED / NOT_FOUND / FOUND_NO_HS_IN_BDD / ALREADY_PRESENT
     source: str              # BDD:BDD_1 / BDD:BDD_2 / WEB_API / NONE / INPUT
-    detail: str              # Always put suggested_hs=... for REVIEW/WEB*
+    detail: str              # explanation, label, scores, etc.
 
 
 @st.cache_data(show_spinner=False)
 def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
-    """
-    Load ONE BDD workbook (first sheet), normalize key columns and tag with source label.
-    """
     df = pd.read_excel(io.BytesIO(bdd_file_bytes), sheet_name=0, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -214,29 +194,20 @@ def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
     df["_DESC_N"] = df[desc_col].astype(str).map(normalize_text) if desc_col else ""
     df["_SUPP_N"] = df[supp_col].astype(str).map(normalize_text) if supp_col else ""
     df["_HS"] = df[hs_col] if hs_col else ""
-
     df["_SRC_FILE"] = file_label  # BDD_1 or BDD_2
     df = df.fillna("")
     return df
 
 
 def load_and_merge_bdds(bdd1_bytes: bytes, bdd2_bytes: Optional[bytes], bdd2_enabled: bool) -> pd.DataFrame:
-    """
-    Merge 1 or 2 BDD sources into one dataset, keeping source label.
-    """
     df1 = load_bdd_single(bdd1_bytes, file_label="BDD_1")
     if bdd2_enabled and bdd2_bytes:
         df2 = load_bdd_single(bdd2_bytes, file_label="BDD_2")
-        merged = pd.concat([df1, df2], ignore_index=True)
-        return merged
+        return pd.concat([df1, df2], ignore_index=True)
     return df1
 
 
 def build_bdd_indexes(bdd: pd.DataFrame):
-    """
-    Build global + supplier-scoped indexes.
-    Store best match as (hs, src_file).
-    """
     code_to_best: Dict[str, Tuple[str, str]] = {}
     desc_to_best: Dict[str, Tuple[str, str]] = {}
     desc_list: List[str] = []
@@ -245,7 +216,6 @@ def build_bdd_indexes(bdd: pd.DataFrame):
     supp_desc_to_best: Dict[str, Dict[str, Tuple[str, str]]] = {}
     supp_desc_list: Dict[str, List[str]] = {}
 
-    # rule: keep first non-empty HS encountered
     for _, row in bdd.iterrows():
         code = safe_str(row.get("_CODE_N", ""))
         desc = safe_str(row.get("_DESC_N", ""))
@@ -278,24 +248,13 @@ def build_bdd_indexes(bdd: pd.DataFrame):
 
 
 def fuzzy_best_two(query: str, choices: List[str]):
-    """
-    Return best and second best matches: (best_choice, best_score), (second_choice, second_score)
-    """
     if not query or not choices:
         return None, None
-
-    results = process.extract(
-        query,
-        choices,
-        scorer=fuzz.WRatio,
-        limit=2
-    )
+    results = process.extract(query, choices, scorer=fuzz.WRatio, limit=2)
     if not results:
         return None, None
-
-    best = results[0]  # (choice, score, idx)
+    best = results[0]
     second = results[1] if len(results) > 1 else None
-
     best_tuple = (best[0], int(best[1]))
     second_tuple = (second[0], int(second[1])) if second else None
     return best_tuple, second_tuple
@@ -313,13 +272,10 @@ def match_row(
     web_year: int
 ) -> MatchResult:
     """
-    Behavior:
-      - EXACT: fill HS
-      - FUZZY (high confidence): fill HS
-      - REVIEW: DO NOT fill HS, but include suggested_hs in detail
-      - WEB_REVIEW: DO NOT fill HS, but include suggested_hs + label in detail
-      - WEB_BLOCKED: DO NOT fill, but include suggested_hs + why it was blocked
-      - Web is used only as last resort and never auto-fills.
+    New rule:
+      - In uncertain cases (REVIEW / WEB_REVIEW / WEB_BLOCKED), we ALSO return hs_code (suggested),
+        so it will be written into the HS column to ease comparison.
+      - Users must check HS_MATCH_TYPE to know if it's auto-filled or suggestion.
     """
     code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list = indexes
 
@@ -331,7 +287,7 @@ def match_row(
     scoped_desc = supp_desc_to_best.get(supp_n) if supp_n else None
     scoped_list = supp_desc_list.get(supp_n) if supp_n else None
 
-    # 1) Exact by code (supplier first)
+    # 1) Exact by code
     if code_n:
         if scoped_code:
             best = scoped_code.get(code_n)
@@ -367,7 +323,6 @@ def match_row(
             second_score = second[1] if second else 0
             margin = best_score - second_score
 
-            # Find hs for that matched desc (if exists)
             hs_src: Optional[Tuple[str, str]] = None
             if choices_source == "supplier-scoped" and scoped_desc:
                 hs_src = scoped_desc.get(best_desc)
@@ -377,46 +332,42 @@ def match_row(
             if hs_src:
                 hs, srcfile = hs_src
 
-                # Auto-fill only if very confident
+                # Auto-fill when confident
                 if best_score >= auto_fill_threshold and margin >= margin_top2:
                     return MatchResult(
                         hs,
                         "FUZZY",
                         f"BDD:{srcfile}",
-                        f'fuzzy({choices_source}) AUTO; hs={hs}; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                        f'fuzzy({choices_source}) AUTO; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
 
-                # Otherwise: REVIEW suggestion, DO NOT FILL
+                # REVIEW (uncertain) -> return suggested HS so it is written in HS column
                 if best_score >= review_threshold:
                     return MatchResult(
-                        None,
+                        hs,
                         "REVIEW",
                         f"BDD:{srcfile}",
-                        f'suggested_hs={hs}; fuzzy({choices_source}) REVIEW; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                        f'fuzzy({choices_source}) REVIEW; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
 
             else:
-                # Fuzzy matched description exists but HS missing in BDD
-                # => can optionally propose WEB suggestion, but NEVER fill
+                # Fuzzy matched but HS missing in BDD -> try web suggestion
                 if enable_web and libelle:
                     web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
                     if web:
                         hs_web, label = web
-
-                        # Option B: block obvious web-food mismatch
                         if block_web_if_obviously_wrong(libelle, hs_web):
                             return MatchResult(
-                                None,
+                                hs_web,  # still write suggested HS in HS column
                                 "WEB_BLOCKED",
                                 "WEB_API",
-                                f'blocked_web_obvious_mismatch; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
+                                f'web suggestion blocked (obvious mismatch); label="{label[:140]}"; year={web_year}'
                             )
-
                         return MatchResult(
-                            None,
+                            hs_web,
                             "WEB_REVIEW",
                             "WEB_API",
-                            f'suggested_hs={hs_web}; web(api) after fuzzy HS-missing; fuzzy_score={best_score}; label="{label[:120]}"; year={web_year}'
+                            f'web suggestion; label="{label[:140]}"; year={web_year}'
                         )
                 return MatchResult(
                     None,
@@ -425,26 +376,23 @@ def match_row(
                     f'fuzzy matched but HS missing in BDD; score={best_score}; matched="{best_desc[:120]}"'
                 )
 
-    # 4) Web fallback (last resort) — suggestion only (+ Option B sanity check)
+    # 4) Web fallback
     if enable_web and libelle:
         web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
         if web:
             hs_web, label = web
-
-            # Option B: block obvious web-food mismatch
             if block_web_if_obviously_wrong(libelle, hs_web):
                 return MatchResult(
-                    None,
+                    hs_web,
                     "WEB_BLOCKED",
                     "WEB_API",
-                    f'blocked_web_obvious_mismatch; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
+                    f'web suggestion blocked (obvious mismatch); label="{label[:140]}"; year={web_year}'
                 )
-
             return MatchResult(
-                None,
+                hs_web,
                 "WEB_REVIEW",
                 "WEB_API",
-                f'suggested_hs={hs_web}; web(api) "{label[:120]}"; year={web_year}'
+                f'web suggestion; label="{label[:140]}"; year={web_year}'
             )
 
     return MatchResult(None, "NOT_FOUND", "NONE", "no match")
@@ -509,7 +457,7 @@ def process_workbook(
                     web_year=web_year
                 )
 
-                # Fill HS only if res.hs_code provided (EXACT / FUZZY only)
+                # NEW RULE: write HS if res.hs_code exists (even for REVIEW/WEB*)
                 hscode = safe_str(res.hs_code)
                 if hscode:
                     df.at[i, hs_col] = hscode
@@ -518,7 +466,7 @@ def process_workbook(
                 df.at[i, "HS_SOURCE"] = res.source
                 df.at[i, "HS_MATCH_DETAIL"] = res.detail
 
-            # Reorder: insert meta cols right after hs col
+            # Reorder: meta cols right after HS col
             cols = list(df.columns)
             for mc in meta_cols:
                 cols.remove(mc)
@@ -533,52 +481,44 @@ def process_workbook(
 
 
 # ----------------------------
-# Streamlit UI
+# Streamlit UI (clean)
 # ----------------------------
 st.set_page_config(page_title="HS Code Finder", layout="wide")
-st.title("HS Code Finder — 2 BDD + fuzzy (anti-faux positifs) + web (safe + anti-absurde)")
+st.title("HS Code Finder")
 
-st.markdown(
-    """
-**But :** uploader un Excel avec une colonne HS Code vide → enrichir automatiquement depuis **1 ou 2 BDD** (sources de vérité).  
-
-**Option B activée :**  
-- le WEB ne remplit jamais, il propose (`WEB_REVIEW`)  
-- et il **bloque les suggestions absurdes** (ex: chapitres FOOD 01–24 pour un libellé non-food) → `WEB_BLOCKED`  
-- les suggestions contiennent toujours `suggested_hs=...` dans `HS_MATCH_DETAIL`
-"""
-)
+st.caption("Compléter automatiquement la colonne HS Code à partir d’1 ou 2 fichiers historiques, avec suggestions en cas d’incertitude.")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    input_file = st.file_uploader("1) Excel à compléter (multi-onglets OK)", type=["xlsx", "xlsm"])
+    input_file = st.file_uploader("Excel à compléter (multi-onglets)", type=["xlsx", "xlsm"])
 with col2:
-    bdd1_file = st.file_uploader("2) BDD source de vérité #1 (xlsm/xlsx)", type=["xlsx", "xlsm"])
+    bdd1_file = st.file_uploader("BDD source #1", type=["xlsx", "xlsm"])
 with col3:
-    bdd2_file = st.file_uploader("3) BDD source de vérité #2 (optionnel)", type=["xlsx", "xlsm"])
+    bdd2_file = st.file_uploader("BDD source #2 (optionnel)", type=["xlsx", "xlsm"])
 bdd2_enabled = bdd2_file is not None
 
 st.divider()
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    auto_fill_threshold = st.slider("Seuil AUTO-FILL (fuzzy) — remplit HS", 80, 99, 95, 1)
+    auto_fill_threshold = st.slider("Seuil AUTO-FILL (remplissage automatique)", 80, 99, 95, 1)
 with c2:
-    review_threshold = st.slider("Seuil REVIEW — suggestion sans remplir", 60, 98, 90, 1)
+    review_threshold = st.slider("Seuil REVIEW (suggestion)", 60, 98, 90, 1)
 with c3:
-    margin_top2 = st.slider("Marge Top1 vs Top2 (anti-rouge)", 0, 20, 8, 1)
+    margin_top2 = st.slider("Marge Top1 vs Top2 (anti-faux positifs)", 0, 20, 8, 1)
 
-enable_web = st.checkbox("Activer le web (tarifdouanier.eu) — suggestion only + anti-absurde FOOD", value=True)
+enable_web = st.checkbox("Activer la recherche web (suggestions)", value=True)
 web_year = st.selectbox("Année tarif", options=[2024, 2025, 2026], index=2)
 
 st.caption(
-    "Astuce : si tu as du faux positif (rouge) → monte AUTO-FILL (95-97) et/ou augmente la marge (8-12). "
-    "Les cas REVIEW/WEB_REVIEW sont des suggestions sans remplissage. "
-    "WEB_BLOCKED signifie : suggestion web bloquée car manifestement incohérente (ex. FOOD sans mots food)."
+    "Lecture des résultats : "
+    "EXACT/FUZZY = fiable (rempli automatiquement). "
+    "REVIEW/WEB_REVIEW/WEB_BLOCKED = HS écrit mais à valider. "
+    "NOT_FOUND = aucune piste."
 )
 
 if input_file and bdd1_file:
-    st.success("Fichiers chargés. Lance l’enrichissement.")
+    st.success("Fichiers chargés.")
     if st.button("🚀 Enrichir et générer l’Excel", type="primary"):
         with st.spinner("Traitement…"):
             out_bytes = process_workbook(
@@ -600,4 +540,4 @@ if input_file and bdd1_file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
-    st.info("Charge l’Excel à compléter + au moins la BDD #1.")
+    st.info("Charge l’Excel à compléter + au moins la BDD source #1.")
