@@ -26,6 +26,19 @@ def normalize_text(s: Optional[str]) -> str:
     return s
 
 
+def safe_str(x: Any) -> str:
+    s = "" if x is None else str(x)
+    s = s.strip()
+    return "" if s.lower() == "nan" else s
+
+
+def get_ext(filename: str) -> str:
+    filename = filename or ""
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].lower().strip()
+
+
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {str(c).lower().strip(): c for c in df.columns}
     for cand in candidates:
@@ -48,10 +61,24 @@ def find_hs_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def safe_str(x: Any) -> str:
-    s = "" if x is None else str(x)
-    s = s.strip()
-    return "" if s.lower() == "nan" else s
+# ----------------------------
+# "Vêtements" detection (simple tightening)
+# ----------------------------
+def is_apparel_label(label: str) -> bool:
+    t = normalize_text(label)
+
+    apparel_kw = [
+        "POLO", "T SHIRT", "TSHIRT", "TEE SHIRT", "TEE", "CHEMISE", "BLOUSE",
+        "PANTALON", "JEAN", "SHORT", "ROBE", "JUPE", "VESTE", "MANTEAU",
+        "SWEAT", "HOODIE", "PULL", "CARDIGAN", "MAILLOT", "TENUE",
+        "CHAUSSETTE", "CHAUSSETTES", "SOUS VETEMENT", "SOUSVETEMENT",
+        "CASQUETTE", "BONNET", "ECHARPE", "GANT", "GANTS",
+        "BASKET", "CHAUSSURE", "CHAUSSURES", "SANDALE", "SANDALES",
+        "COTON", "POLYESTER", "ELASTHANNE", "LAINE", "LIN", "VISCOSE",
+        "TAILLE", "HOMME", "FEMME", "ENFANT"
+    ]
+
+    return any(k in t for k in apparel_kw)
 
 
 # ----------------------------
@@ -130,6 +157,7 @@ def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
             else:
                 if code_str.isdigit() and len(code_str) >= 6:
                     candidates.append((code_str[:6], str(label).strip()))
+
     return candidates
 
 
@@ -174,14 +202,15 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
 # ----------------------------
 @dataclass
 class MatchResult:
-    hs_code: Optional[str]   # For EXACT/FUZZY: filled. For REVIEW/WEB: suggested HS (now also written in HS column).
-    match_type: str          # EXACT / FUZZY / REVIEW / WEB_REVIEW / WEB_BLOCKED / NOT_FOUND / FOUND_NO_HS_IN_BDD / ALREADY_PRESENT
-    source: str              # BDD:BDD_1 / BDD:BDD_2 / WEB_API / NONE / INPUT
-    detail: str              # explanation, label, scores, etc.
+    hs_code: Optional[str]   # also written in HS column for REVIEW/WEB*
+    match_type: str
+    source: str
+    detail: str
 
 
 @st.cache_data(show_spinner=False)
 def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
+    # BDD expected in xlsx/xlsm mostly; openpyxl handles both.
     df = pd.read_excel(io.BytesIO(bdd_file_bytes), sheet_name=0, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -271,12 +300,6 @@ def match_row(
     enable_web: bool,
     web_year: int
 ) -> MatchResult:
-    """
-    New rule:
-      - In uncertain cases (REVIEW / WEB_REVIEW / WEB_BLOCKED), we ALSO return hs_code (suggested),
-        so it will be written into the HS column to ease comparison.
-      - Users must check HS_MATCH_TYPE to know if it's auto-filled or suggestion.
-    """
     code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list = indexes
 
     code_n = normalize_text(article_code)
@@ -286,6 +309,15 @@ def match_row(
     scoped_code = supp_code_to_best.get(supp_n) if supp_n else None
     scoped_desc = supp_desc_to_best.get(supp_n) if supp_n else None
     scoped_list = supp_desc_list.get(supp_n) if supp_n else None
+
+    # Tightening for apparel labels (reduce wrong matches)
+    af = auto_fill_threshold
+    rv = review_threshold
+    mg = margin_top2
+    if is_apparel_label(libelle):
+        af = min(99, af + 2)
+        rv = min(98, rv + 2)
+        mg = mg + 2
 
     # 1) Exact by code
     if code_n:
@@ -333,7 +365,7 @@ def match_row(
                 hs, srcfile = hs_src
 
                 # Auto-fill when confident
-                if best_score >= auto_fill_threshold and margin >= margin_top2:
+                if best_score >= af and margin >= mg:
                     return MatchResult(
                         hs,
                         "FUZZY",
@@ -341,8 +373,8 @@ def match_row(
                         f'fuzzy({choices_source}) AUTO; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
 
-                # REVIEW (uncertain) -> return suggested HS so it is written in HS column
-                if best_score >= review_threshold:
+                # REVIEW (uncertain) -> still write suggested HS in HS column
+                if best_score >= rv:
                     return MatchResult(
                         hs,
                         "REVIEW",
@@ -358,7 +390,7 @@ def match_row(
                         hs_web, label = web
                         if block_web_if_obviously_wrong(libelle, hs_web):
                             return MatchResult(
-                                hs_web,  # still write suggested HS in HS column
+                                hs_web,
                                 "WEB_BLOCKED",
                                 "WEB_API",
                                 f'web suggestion blocked (obvious mismatch); label="{label[:140]}"; year={web_year}'
@@ -369,6 +401,7 @@ def match_row(
                             "WEB_API",
                             f'web suggestion; label="{label[:140]}"; year={web_year}'
                         )
+
                 return MatchResult(
                     None,
                     "FOUND_NO_HS_IN_BDD",
@@ -400,6 +433,7 @@ def match_row(
 
 def process_workbook(
     input_bytes: bytes,
+    input_name: str,
     bdd1_bytes: bytes,
     bdd2_bytes: Optional[bytes],
     bdd2_enabled: bool,
@@ -409,12 +443,22 @@ def process_workbook(
     enable_web: bool,
     web_year: int
 ) -> bytes:
+    # Load/merge BDD
     bdd = load_and_merge_bdds(bdd1_bytes, bdd2_bytes, bdd2_enabled)
     indexes = build_bdd_indexes(bdd)
 
-    xls = pd.ExcelFile(io.BytesIO(input_bytes), engine="openpyxl")
+    # Choose engine for INPUT workbook based on extension
+    ext = get_ext(input_name)
+    if ext == "xls":
+        # requires xlrd in requirements
+        xls = pd.ExcelFile(io.BytesIO(input_bytes), engine="xlrd")
+    else:
+        # xlsx/xlsm
+        xls = pd.ExcelFile(io.BytesIO(input_bytes), engine="openpyxl")
+
     out_buffer = io.BytesIO()
 
+    # Output always xlsx
     with pd.ExcelWriter(out_buffer, engine="openpyxl") as writer:
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
@@ -457,7 +501,7 @@ def process_workbook(
                     web_year=web_year
                 )
 
-                # NEW RULE: write HS if res.hs_code exists (even for REVIEW/WEB*)
+                # Write HS if suggested or exact (your current behavior)
                 hscode = safe_str(res.hs_code)
                 if hscode:
                     df.at[i, hs_col] = hscode
@@ -485,16 +529,18 @@ def process_workbook(
 # ----------------------------
 st.set_page_config(page_title="HS Code Finder", layout="wide")
 st.title("HS Code Finder")
-
 st.caption("Compléter automatiquement la colonne HS Code à partir d’1 ou 2 fichiers historiques, avec suggestions en cas d’incertitude.")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    input_file = st.file_uploader("Excel à compléter (multi-onglets)", type=["xlsx", "xlsm"])
+    input_file = st.file_uploader(
+        "Excel à compléter (multi-onglets)",
+        type=["xls", "xlsx", "xlsm"]  # ✅ extended
+    )
 with col2:
-    bdd1_file = st.file_uploader("BDD source #1", type=["xlsx", "xlsm"])
+    bdd1_file = st.file_uploader("BDD source #1", type=["xlsx", "xlsm", "xls"])
 with col3:
-    bdd2_file = st.file_uploader("BDD source #2 (optionnel)", type=["xlsx", "xlsm"])
+    bdd2_file = st.file_uploader("BDD source #2 (optionnel)", type=["xlsx", "xlsm", "xls"])
 bdd2_enabled = bdd2_file is not None
 
 st.divider()
@@ -511,10 +557,10 @@ enable_web = st.checkbox("Activer la recherche web (suggestions)", value=True)
 web_year = st.selectbox("Année tarif", options=[2024, 2025, 2026], index=2)
 
 st.caption(
-    "Lecture des résultats : "
-    "EXACT/FUZZY = fiable (rempli automatiquement). "
+    "Lecture des résultats : EXACT/FUZZY = rempli automatiquement. "
     "REVIEW/WEB_REVIEW/WEB_BLOCKED = HS écrit mais à valider. "
-    "NOT_FOUND = aucune piste."
+    "NOT_FOUND = aucune piste. "
+    "Amélioration textile : seuils automatiquement plus stricts si le libellé ressemble à un vêtement."
 )
 
 if input_file and bdd1_file:
@@ -523,6 +569,7 @@ if input_file and bdd1_file:
         with st.spinner("Traitement…"):
             out_bytes = process_workbook(
                 input_bytes=input_file.read(),
+                input_name=input_file.name,  # ✅ needed to choose xls vs xlsx/xlsm
                 bdd1_bytes=bdd1_file.read(),
                 bdd2_bytes=bdd2_file.read() if bdd2_enabled else None,
                 bdd2_enabled=bdd2_enabled,
