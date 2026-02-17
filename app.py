@@ -10,9 +10,9 @@ from rapidfuzz import process, fuzz
 import requests
 
 
-# ============================================================
-# Normalisation / Helpers
-# ============================================================
+# ----------------------------
+# Helpers
+# ----------------------------
 def normalize_text(s: Optional[str]) -> str:
     if s is None:
         return ""
@@ -24,12 +24,6 @@ def normalize_text(s: Optional[str]) -> str:
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-
-def safe_str(x: Any) -> str:
-    s = "" if x is None else str(x)
-    s = s.strip()
-    return "" if s.lower() == "nan" else s
 
 
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -54,97 +48,23 @@ def find_hs_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-# ============================================================
-# Niveau 1 IA : Catégorisation (keywords) + gating
-# ============================================================
-CATEGORY_KEYWORDS: Dict[str, List[str]] = {
-    # Textile / vêtements
-    "TEXTILE": [
-        "POLO", "T SHIRT", "TSHIRT", "TEE SHIRT", "CHEMISE", "PANTALON", "JEAN", "SHORT",
-        "VESTE", "SWEAT", "PULL", "MAILLOT", "ROBE", "JUPE", "BLOUSE", "MANTEAU",
-        "HOMME", "FEMME", "ENFANT", "BEBE", "TAILLE", "COTON", "POLYESTER", "ELASTHAN",
-        "TEXTILE", "TENUE", "UNIFORME", "COSTUME", "CAPUCHE", "GILET", "CHAUSSETTE",
-        "CASQUETTE", "CHAPEAU", "BONNET", "ECHARPE", "GANT", "GANTS"
-    ],
-    # Sport / loisirs / équipements sportifs
-    "SPORT": [
-        "BALLE", "BALL", "RAQUETTE", "RACKET", "ARC", "FLECHE", "FLECHES", "TIR",
-        "SPORT", "SPORTIF", "ARCHERY", "BOW", "ARROW", "BULLETS", "BALLON",
-        "EQUIPEMENT", "EQUIPEMENTS", "ENTRAINEMENT", "FITNESS", "GYM", "BADMINTON"
-    ],
-    # Meubles / mobilier / aménagement
-    "FURNITURE": [
-        "TABLE", "TABLE BASSE", "CHAISE", "FAUTEUIL", "CANAPE", "ARMOIRE", "ETAGERE",
-        "MEUBLE", "MOBILIER", "BUREAU", "LIT", "MATELAS", "SOMMIER", "TABOURET",
-        "PARASOL", "TRANSAT", "BANC", "TAPIS", "PLANCHE", "DECOR", "DECORATION"
-    ],
-    # Cosmétique / maquillage
-    "COSMETICS": [
-        "MAQUILLAGE", "ROUGE", "LEVRES", "LIPSTICK", "PINCEAU", "PAILLETTES",
-        "COSMETIQUE", "BEAUTE", "EPONGE", "FARD", "GLOSS", "MASCARA"
-    ],
-    # Sacs / bagagerie / pochettes
-    "BAGS": [
-        "SAC", "POCHETTE", "BAG", "BAGEL", "POUCH", "VALISE", "LUGGAGE"
-    ],
-    # Food / alimentaire (très important pour éviter les œufs)
-    "FOOD": [
+def safe_str(x: Any) -> str:
+    s = "" if x is None else str(x)
+    s = s.strip()
+    return "" if s.lower() == "nan" else s
+
+
+# ----------------------------
+# WEB sanity check (Option B)
+# ----------------------------
+def is_food_like_label(label: str) -> bool:
+    t = normalize_text(label)
+    food_kw = [
         "OEUF", "OEUFS", "VOLAILLE", "POISSON", "VIANDE", "FROMAGE", "LAIT", "BEURRE",
-        "BOISSON", "VIN", "BIERE", "EAU", "CHOCOLAT", "SUCRE", "FARINE"
-    ],
-    # Papier / imprimerie / papeterie (au cas où)
-    "PAPER": [
-        "PAPIER", "CARTON", "IMPRIME", "ETIQUETTE", "STICKER", "BROCHURE", "LIVRET"
-    ],
-}
-
-
-def categorize_text(text: str) -> str:
-    """
-    Heuristic category: choose the category with the most keyword hits.
-    If tie or no hit -> OTHER
-    """
-    t = normalize_text(text)
-    if not t:
-        return "OTHER"
-
-    # Make sure multiword tokens match correctly
-    score: Dict[str, int] = {}
-    for cat, kws in CATEGORY_KEYWORDS.items():
-        cnt = 0
-        for kw in kws:
-            kw_n = normalize_text(kw)
-            # whole word-ish match
-            if f" {kw_n} " in f" {t} ":
-                cnt += 2  # strong hit
-            elif kw_n in t:
-                cnt += 1  # weak hit
-        score[cat] = cnt
-
-    best_cat = max(score, key=lambda k: score[k])
-    if score[best_cat] <= 0:
-        return "OTHER"
-
-    # If top is not clearly better, keep OTHER to avoid over-filtering
-    sorted_scores = sorted(score.values(), reverse=True)
-    if len(sorted_scores) >= 2 and sorted_scores[0] == sorted_scores[1]:
-        return "OTHER"
-
-    return best_cat
-
-
-# Allowed HS "chapters" (2-digit) per category — coarse but very effective
-# HS is 6 digits; chapter is first 2 digits
-ALLOWED_HS_CHAPTERS: Dict[str, List[str]] = {
-    "TEXTILE": [str(i).zfill(2) for i in range(50, 64)],  # textiles, apparel, etc.
-    "SPORT": ["95"],                                      # toys/sports goods (very common)
-    "FURNITURE": ["94"],                                  # furniture
-    "COSMETICS": ["33"],                                  # essential oils, perfumes, cosmetics
-    "BAGS": ["42"],                                       # travel goods, bags, etc.
-    "FOOD": [str(i).zfill(2) for i in range(1, 25)],       # broad food chapters
-    "PAPER": ["48", "49"],                                 # paper / printed
-    "OTHER": []                                            # no restriction
-}
+        "BOISSON", "VIN", "BIERE", "EAU", "CHOCOLAT", "SUCRE", "FARINE", "RIZ", "PATES",
+        "FRUIT", "LEGUME", "CONSERVE", "SAUCE", "EPICE", "THE", "CAFE"
+    ]
+    return any(k in t for k in food_kw)
 
 
 def hs_chapter(hs: str) -> str:
@@ -152,20 +72,29 @@ def hs_chapter(hs: str) -> str:
     return digits[:2] if len(digits) >= 2 else ""
 
 
-def hs_allowed_for_category(hs: str, cat: str) -> bool:
-    cat = cat or "OTHER"
-    allowed = ALLOWED_HS_CHAPTERS.get(cat, [])
-    if not allowed:
-        return True  # no restriction
+def block_web_if_obviously_wrong(label: str, hs: str) -> bool:
+    """
+    Block only the worst obvious cases:
+    - If suggested HS is in food chapters (01..24) but label doesn't look like food.
+    This prevents: "table basse" -> eggs.
+    """
     ch = hs_chapter(hs)
-    return ch in allowed
+    if ch and ("01" <= ch <= "24") and (not is_food_like_label(label)):
+        return True
+    return False
 
 
-# ============================================================
-# TarifDouanier API lookup (WEB) — suggestion only
-# ============================================================
+# ----------------------------
+# TariffDouanier API lookup (WEB)
+# IMPORTANT: WEB is SUGGESTION ONLY (never auto-fill)
+# ----------------------------
 def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
+    """
+    Return list of (code, label/desc) from unknown JSON shapes.
+    Best-effort schema resilience.
+    """
     candidates: List[Tuple[str, str]] = []
+
     if api_data is None:
         return candidates
 
@@ -203,6 +132,7 @@ def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
         if code:
             code_str = str(code).strip()
             code_digits = re.sub(r"\D", "", code_str)
+            # We keep 6 digits for your use-case
             if len(code_digits) >= 6:
                 candidates.append((code_digits[:6], str(label).strip()))
             else:
@@ -214,12 +144,22 @@ def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr") -> Optional[Tuple[str, str]]:
+    """
+    Official API:
+      - V1: /api/v1/cnSuggest?term=...&lang=fr&year=2024
+      - V2: /api/v2/cnSuggest?term=...&lang=fr
+    Return first suggestion (hs_code_6digits, label) or None.
+    """
     term_n = normalize_text(term)
     if not term_n:
         return None
 
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
 
+    # V1 (year supported)
     try:
         url_v1 = "https://www.tarifdouanier.eu/api/v1/cnSuggest"
         r = requests.get(url_v1, params={"term": term_n, "lang": lang, "year": str(year)}, headers=headers, timeout=15)
@@ -231,6 +171,7 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
     except Exception:
         pass
 
+    # V2 fallback
     try:
         url_v2 = "https://www.tarifdouanier.eu/api/v2/cnSuggest"
         r = requests.get(url_v2, params={"term": term_n, "lang": lang}, headers=headers, timeout=15)
@@ -245,27 +186,27 @@ def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr
     return None
 
 
-# ============================================================
+# ----------------------------
 # Matching engine
-# ============================================================
+# ----------------------------
 @dataclass
 class MatchResult:
-    hs_code: Optional[str]  # only if we fill HS CODE
-    match_type: str         # EXACT / FUZZY / REVIEW / WEB_REVIEW / WEB_BLOCKED / NOT_FOUND / FOUND_NO_HS_IN_BDD / ALREADY_PRESENT / REVIEW_BLOCKED
-    source: str             # BDD:BDD_1 / BDD:BDD_2 / WEB_API / NONE / INPUT
-    detail: str             # include suggested_hs=... for review/web
+    hs_code: Optional[str]   # Only set when we REALLY fill HS CODE
+    match_type: str          # EXACT / FUZZY / REVIEW / WEB_REVIEW / WEB_BLOCKED / NOT_FOUND / FOUND_NO_HS_IN_BDD / ALREADY_PRESENT
+    source: str              # BDD:BDD_1 / BDD:BDD_2 / WEB_API / NONE / INPUT
+    detail: str              # Always put suggested_hs=... for REVIEW/WEB*
 
 
-# ============================================================
-# Load BDD(s) and build indexes
-# ============================================================
 @st.cache_data(show_spinner=False)
 def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
+    """
+    Load ONE BDD workbook (first sheet), normalize key columns and tag with source label.
+    """
     df = pd.read_excel(io.BytesIO(bdd_file_bytes), sheet_name=0, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
 
     code_col = find_col(df, ["CODE ARTICLE", "CODE_ARTICLE", "ARTICLE", "Code article", "Article"])
-    desc_col = find_col(df, ["Description", "DESIGNATION", "LIBELLE", "Libellé", "Libelle"])
+    desc_col = find_col(df, ["Description", "DESIGNATION", "LIBELLE", "Libellé", "Libelle", "Libellé à imprimer", "Libelle a imprimer"])
     hs_col = find_col(df, ["HS CODE", "HS", "HS_CODE", "HS COD", "HSCODE"])
     supp_col = find_col(df, ["Fournisseur", "Supplier", "FOURNISSEUR"])
 
@@ -274,107 +215,92 @@ def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
     df["_SUPP_N"] = df[supp_col].astype(str).map(normalize_text) if supp_col else ""
     df["_HS"] = df[hs_col] if hs_col else ""
 
-    # Category inferred from description (best signal)
-    df["_CAT"] = df["_DESC_N"].astype(str).map(categorize_text)
-
-    df["_SRC_FILE"] = file_label
+    df["_SRC_FILE"] = file_label  # BDD_1 or BDD_2
     df = df.fillna("")
     return df
 
 
 def load_and_merge_bdds(bdd1_bytes: bytes, bdd2_bytes: Optional[bytes], bdd2_enabled: bool) -> pd.DataFrame:
+    """
+    Merge 1 or 2 BDD sources into one dataset, keeping source label.
+    """
     df1 = load_bdd_single(bdd1_bytes, file_label="BDD_1")
     if bdd2_enabled and bdd2_bytes:
         df2 = load_bdd_single(bdd2_bytes, file_label="BDD_2")
-        return pd.concat([df1, df2], ignore_index=True)
+        merged = pd.concat([df1, df2], ignore_index=True)
+        return merged
     return df1
 
 
 def build_bdd_indexes(bdd: pd.DataFrame):
     """
-    Global + supplier-scoped indexes, plus category-specific desc lists.
-
-    We store:
-      - code_to_best[code] = (hs, srcfile)
-      - desc_to_best[desc] = (hs, srcfile, cat)
-      - desc_list (all desc)
-      - desc_list_by_cat[cat] = list(desc)
-
-    Supplier-scoped analogs.
+    Build global + supplier-scoped indexes.
+    Store best match as (hs, src_file).
     """
     code_to_best: Dict[str, Tuple[str, str]] = {}
-    desc_to_best: Dict[str, Tuple[str, str, str]] = {}
+    desc_to_best: Dict[str, Tuple[str, str]] = {}
     desc_list: List[str] = []
-    desc_list_by_cat: Dict[str, List[str]] = {}
 
     supp_code_to_best: Dict[str, Dict[str, Tuple[str, str]]] = {}
-    supp_desc_to_best: Dict[str, Dict[str, Tuple[str, str, str]]] = {}
+    supp_desc_to_best: Dict[str, Dict[str, Tuple[str, str]]] = {}
     supp_desc_list: Dict[str, List[str]] = {}
-    supp_desc_list_by_cat: Dict[str, Dict[str, List[str]]] = {}
 
+    # rule: keep first non-empty HS encountered
     for _, row in bdd.iterrows():
         code = safe_str(row.get("_CODE_N", ""))
         desc = safe_str(row.get("_DESC_N", ""))
         supp = safe_str(row.get("_SUPP_N", ""))
         hs = safe_str(row.get("_HS", ""))
         src_file = safe_str(row.get("_SRC_FILE", "BDD"))
-        cat = safe_str(row.get("_CAT", "OTHER")) or "OTHER"
 
         if code and hs and code not in code_to_best:
             code_to_best[code] = (hs, src_file)
 
         if desc:
             desc_list.append(desc)
-            desc_list_by_cat.setdefault(cat, []).append(desc)
             if hs and desc not in desc_to_best:
-                desc_to_best[desc] = (hs, src_file, cat)
+                desc_to_best[desc] = (hs, src_file)
 
         if supp:
             supp_code_to_best.setdefault(supp, {})
             supp_desc_to_best.setdefault(supp, {})
             supp_desc_list.setdefault(supp, [])
-            supp_desc_list_by_cat.setdefault(supp, {})
 
             if code and hs and code not in supp_code_to_best[supp]:
                 supp_code_to_best[supp][code] = (hs, src_file)
 
             if desc:
                 supp_desc_list[supp].append(desc)
-                supp_desc_list_by_cat[supp].setdefault(cat, []).append(desc)
                 if hs and desc not in supp_desc_to_best[supp]:
-                    supp_desc_to_best[supp][desc] = (hs, src_file, cat)
+                    supp_desc_to_best[supp][desc] = (hs, src_file)
 
-    return (
-        code_to_best,
-        desc_to_best,
-        desc_list,
-        desc_list_by_cat,
-        supp_code_to_best,
-        supp_desc_to_best,
-        supp_desc_list,
-        supp_desc_list_by_cat,
-    )
+    return code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list
 
 
-# ============================================================
-# Fuzzy helpers
-# ============================================================
 def fuzzy_best_two(query: str, choices: List[str]):
+    """
+    Return best and second best matches: (best_choice, best_score), (second_choice, second_score)
+    """
     if not query or not choices:
         return None, None
-    results = process.extract(query, choices, scorer=fuzz.WRatio, limit=2)
+
+    results = process.extract(
+        query,
+        choices,
+        scorer=fuzz.WRatio,
+        limit=2
+    )
     if not results:
         return None, None
-    best = results[0]
+
+    best = results[0]  # (choice, score, idx)
     second = results[1] if len(results) > 1 else None
+
     best_tuple = (best[0], int(best[1]))
     second_tuple = (second[0], int(second[1])) if second else None
     return best_tuple, second_tuple
 
 
-# ============================================================
-# Core match
-# ============================================================
 def match_row(
     article_code: str,
     libelle: str,
@@ -387,34 +313,25 @@ def match_row(
     web_year: int
 ) -> MatchResult:
     """
-    Order:
-      1) EXACT code
-      2) EXACT desc
-      3) FUZZY with category gating (avoid POLO clothes vs POLO balls)
-      4) WEB suggestion only, and blocked if HS chapter incompatible with category
+    Behavior:
+      - EXACT: fill HS
+      - FUZZY (high confidence): fill HS
+      - REVIEW: DO NOT fill HS, but include suggested_hs in detail
+      - WEB_REVIEW: DO NOT fill HS, but include suggested_hs + label in detail
+      - WEB_BLOCKED: DO NOT fill, but include suggested_hs + why it was blocked
+      - Web is used only as last resort and never auto-fills.
     """
-    (
-        code_to_best,
-        desc_to_best,
-        desc_list,
-        desc_list_by_cat,
-        supp_code_to_best,
-        supp_desc_to_best,
-        supp_desc_list,
-        supp_desc_list_by_cat
-    ) = indexes
+    code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list = indexes
 
     code_n = normalize_text(article_code)
     lib_n = normalize_text(libelle)
     supp_n = normalize_text(fournisseur)
 
-    input_cat = categorize_text(libelle)  # category inferred from label
     scoped_code = supp_code_to_best.get(supp_n) if supp_n else None
     scoped_desc = supp_desc_to_best.get(supp_n) if supp_n else None
     scoped_list = supp_desc_list.get(supp_n) if supp_n else None
-    scoped_list_by_cat = supp_desc_list_by_cat.get(supp_n) if supp_n else None
 
-    # 1) Exact by code (supplier first) — trusted
+    # 1) Exact by code (supplier first)
     if code_n:
         if scoped_code:
             best = scoped_code.get(code_n)
@@ -426,46 +343,23 @@ def match_row(
             hs, srcfile = best
             return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "CODE ARTICLE exact")
 
-    # 2) Exact by description — trusted
+    # 2) Exact by description
     if lib_n:
         if scoped_desc and lib_n in scoped_desc:
-            hs, srcfile, cat = scoped_desc[lib_n]
-            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", f"Description exact (supplier-scoped); cat={cat}")
+            hs, srcfile = scoped_desc[lib_n]
+            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "Description exact (supplier-scoped)")
         if lib_n in desc_to_best:
-            hs, srcfile, cat = desc_to_best[lib_n]
-            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", f"Description exact; cat={cat}")
+            hs, srcfile = desc_to_best[lib_n]
+            return MatchResult(hs, "EXACT", f"BDD:{srcfile}", "Description exact")
 
-    # 3) Fuzzy with category gating
+    # 3) Fuzzy
     if lib_n:
-        # Choose list by category if possible
         choices_source = "global"
-        choices = None
-        used_cat_filter = False
-
-        # Supplier-scoped (category)
-        if scoped_list_by_cat and input_cat != "OTHER":
-            cat_list = scoped_list_by_cat.get(input_cat, [])
-            if len(cat_list) >= 25:
-                choices = cat_list
-                choices_source = "supplier-scoped"
-                used_cat_filter = True
-
-        # Global (category)
-        if choices is None and input_cat != "OTHER":
-            cat_list = desc_list_by_cat.get(input_cat, [])
-            if len(cat_list) >= 50:  # global needs bigger pool
-                choices = cat_list
-                choices_source = "global"
-                used_cat_filter = True
-
-        # Fallback (no category list large enough)
-        if choices is None:
-            if scoped_list and len(scoped_list) >= 25:
-                choices = scoped_list
-                choices_source = "supplier-scoped"
-            else:
-                choices = desc_list
-                choices_source = "global"
+        if scoped_list and len(scoped_list) >= 25:
+            choices = scoped_list
+            choices_source = "supplier-scoped"
+        else:
+            choices = desc_list
 
         best, second = fuzzy_best_two(lib_n, choices)
         if best:
@@ -473,108 +367,89 @@ def match_row(
             second_score = second[1] if second else 0
             margin = best_score - second_score
 
-            # Find HS for matched description
-            hs_src: Optional[Tuple[str, str, str]] = None
+            # Find hs for that matched desc (if exists)
+            hs_src: Optional[Tuple[str, str]] = None
             if choices_source == "supplier-scoped" and scoped_desc:
                 hs_src = scoped_desc.get(best_desc)
             if not hs_src:
                 hs_src = desc_to_best.get(best_desc)
 
             if hs_src:
-                hs, srcfile, cand_cat = hs_src
-
-                # If we didn't use category filter (fallback), block cross-category suggestions
-                # This is the key anti "POLO" confusion guard
-                if (not used_cat_filter) and (input_cat != "OTHER") and (cand_cat != input_cat):
-                    return MatchResult(
-                        None,
-                        "REVIEW_BLOCKED",
-                        f"BDD:{srcfile}",
-                        f'blocked_by_category input_cat={input_cat} cand_cat={cand_cat}; '
-                        f'suggested_hs={hs}; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
-                    )
+                hs, srcfile = hs_src
 
                 # Auto-fill only if very confident
                 if best_score >= auto_fill_threshold and margin >= margin_top2:
-                    # Extra safety: HS chapter should be compatible with category (if known)
-                    if input_cat != "OTHER" and not hs_allowed_for_category(hs, input_cat):
-                        return MatchResult(
-                            None,
-                            "REVIEW_BLOCKED",
-                            f"BDD:{srcfile}",
-                            f'blocked_by_hs_chapter input_cat={input_cat}; hs={hs}; '
-                            f'score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
-                        )
                     return MatchResult(
                         hs,
                         "FUZZY",
                         f"BDD:{srcfile}",
-                        f'fuzzy({choices_source}) AUTO; cat={input_cat}; hs={hs}; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                        f'fuzzy({choices_source}) AUTO; hs={hs}; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
 
-                # REVIEW suggestion (no fill)
+                # Otherwise: REVIEW suggestion, DO NOT FILL
                 if best_score >= review_threshold:
-                    # even in review, show suggested_hs
                     return MatchResult(
                         None,
                         "REVIEW",
                         f"BDD:{srcfile}",
-                        f'suggested_hs={hs}; fuzzy({choices_source}) REVIEW; input_cat={input_cat}; cand_cat={cand_cat}; '
-                        f'score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                        f'suggested_hs={hs}; fuzzy({choices_source}) REVIEW; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
                     )
 
             else:
-                # Matched desc but HS missing in BDD
+                # Fuzzy matched description exists but HS missing in BDD
+                # => can optionally propose WEB suggestion, but NEVER fill
                 if enable_web and libelle:
                     web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
                     if web:
                         hs_web, label = web
-                        if input_cat != "OTHER" and not hs_allowed_for_category(hs_web, input_cat):
+
+                        # Option B: block obvious web-food mismatch
+                        if block_web_if_obviously_wrong(libelle, hs_web):
                             return MatchResult(
                                 None,
                                 "WEB_BLOCKED",
                                 "WEB_API",
-                                f'blocked_web_by_category input_cat={input_cat}; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
+                                f'blocked_web_obvious_mismatch; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
                             )
+
                         return MatchResult(
                             None,
                             "WEB_REVIEW",
                             "WEB_API",
-                            f'suggested_hs={hs_web}; web(api) after fuzzy HS-missing; input_cat={input_cat}; fuzzy_score={best_score}; '
-                            f'label="{label[:120]}"; year={web_year}'
+                            f'suggested_hs={hs_web}; web(api) after fuzzy HS-missing; fuzzy_score={best_score}; label="{label[:120]}"; year={web_year}'
                         )
                 return MatchResult(
                     None,
                     "FOUND_NO_HS_IN_BDD",
                     "BDD",
-                    f'fuzzy matched but HS missing in BDD; input_cat={input_cat}; score={best_score}; matched="{best_desc[:120]}"'
+                    f'fuzzy matched but HS missing in BDD; score={best_score}; matched="{best_desc[:120]}"'
                 )
 
-    # 4) Web fallback — suggestion only (+ block if incompatible with category)
+    # 4) Web fallback (last resort) — suggestion only (+ Option B sanity check)
     if enable_web and libelle:
         web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
         if web:
             hs_web, label = web
-            if input_cat != "OTHER" and not hs_allowed_for_category(hs_web, input_cat):
+
+            # Option B: block obvious web-food mismatch
+            if block_web_if_obviously_wrong(libelle, hs_web):
                 return MatchResult(
                     None,
                     "WEB_BLOCKED",
                     "WEB_API",
-                    f'blocked_web_by_category input_cat={input_cat}; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
+                    f'blocked_web_obvious_mismatch; suggested_hs={hs_web}; label="{label[:120]}"; year={web_year}'
                 )
+
             return MatchResult(
                 None,
                 "WEB_REVIEW",
                 "WEB_API",
-                f'suggested_hs={hs_web}; web(api) input_cat={input_cat}; "{label[:120]}"; year={web_year}'
+                f'suggested_hs={hs_web}; web(api) "{label[:120]}"; year={web_year}'
             )
 
-    return MatchResult(None, "NOT_FOUND", "NONE", f"no match; input_cat={input_cat}")
+    return MatchResult(None, "NOT_FOUND", "NONE", "no match")
 
 
-# ============================================================
-# Process workbook (multi tabs)
-# ============================================================
 def process_workbook(
     input_bytes: bytes,
     bdd1_bytes: bytes,
@@ -634,7 +509,7 @@ def process_workbook(
                     web_year=web_year
                 )
 
-                # Fill only for EXACT / FUZZY (hs_code not None)
+                # Fill HS only if res.hs_code provided (EXACT / FUZZY only)
                 hscode = safe_str(res.hs_code)
                 if hscode:
                     df.at[i, hs_col] = hscode
@@ -643,7 +518,7 @@ def process_workbook(
                 df.at[i, "HS_SOURCE"] = res.source
                 df.at[i, "HS_MATCH_DETAIL"] = res.detail
 
-            # Reorder columns: meta cols right after HS col
+            # Reorder: insert meta cols right after hs col
             cols = list(df.columns)
             for mc in meta_cols:
                 cols.remove(mc)
@@ -657,17 +532,20 @@ def process_workbook(
     return out_buffer.getvalue()
 
 
-# ============================================================
+# ----------------------------
 # Streamlit UI
-# ============================================================
+# ----------------------------
 st.set_page_config(page_title="HS Code Finder", layout="wide")
-st.title("HS Code Finder — 2 BDD + fuzzy + IA niveau 1 (catégories anti-confusion) + web (safe suggestions)")
+st.title("HS Code Finder — 2 BDD + fuzzy (anti-faux positifs) + web (safe + anti-absurde)")
 
 st.markdown(
     """
 **But :** uploader un Excel avec une colonne HS Code vide → enrichir automatiquement depuis **1 ou 2 BDD** (sources de vérité).  
-✅ **IA Niveau 1** : catégorisation par mots-clés (TEXTILE/SPORT/MEUBLE/...) pour éviter les confusions (`POLO homme` ≠ `balles de polo`).  
-✅ **WEB safe** : la recherche web **ne remplit jamais** le HS. Elle propose (`WEB_REVIEW`) ou bloque (`WEB_BLOCKED`) si incohérent.
+
+**Option B activée :**  
+- le WEB ne remplit jamais, il propose (`WEB_REVIEW`)  
+- et il **bloque les suggestions absurdes** (ex: chapitres FOOD 01–24 pour un libellé non-food) → `WEB_BLOCKED`  
+- les suggestions contiennent toujours `suggested_hs=...` dans `HS_MATCH_DETAIL`
 """
 )
 
@@ -690,17 +568,13 @@ with c2:
 with c3:
     margin_top2 = st.slider("Marge Top1 vs Top2 (anti-rouge)", 0, 20, 8, 1)
 
-enable_web = st.checkbox("Activer le web (tarifdouanier.eu) — suggestion only + blocage hors catégorie", value=True)
+enable_web = st.checkbox("Activer le web (tarifdouanier.eu) — suggestion only + anti-absurde FOOD", value=True)
 web_year = st.selectbox("Année tarif", options=[2024, 2025, 2026], index=2)
 
-with st.expander("Voir les catégories & règles (debug)"):
-    st.write("Catégories détectées via keywords :", list(CATEGORY_KEYWORDS.keys()) + ["OTHER"])
-    st.write("Chapitres HS autorisés (2 digits) par catégorie :", ALLOWED_HS_CHAPTERS)
-    st.caption("Si tu veux, on peut enrichir les keywords avec votre vocabulaire Club Med (très efficace).")
-
 st.caption(
-    "Conseil : pour limiter les erreurs → AUTO-FILL 95-97, REVIEW 88-92, marge 8-10. "
-    "Les types WEB_BLOCKED / REVIEW_BLOCKED expliquent les blocages (catégorie/chapitre HS)."
+    "Astuce : si tu as du faux positif (rouge) → monte AUTO-FILL (95-97) et/ou augmente la marge (8-12). "
+    "Les cas REVIEW/WEB_REVIEW sont des suggestions sans remplissage. "
+    "WEB_BLOCKED signifie : suggestion web bloquée car manifestement incohérente (ex. FOOD sans mots food)."
 )
 
 if input_file and bdd1_file:
