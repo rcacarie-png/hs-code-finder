@@ -285,13 +285,15 @@ def process_workbook(
                     enable_web=enable_web
                 )
 
-                if res.hscode := res.hs_code:
-                    df.at[i, hs_col] = res.hscode
+                hscode = res.hs_code
+                if hscode:
+                    df.at[i, hs_col] = hscode
+
 
                 df.at[i, "HS_MATCH_TYPE"] = res.match_type
                 df.at[i, "HS_SOURCE"] = res.source
                 df.at[i, "HS_MATCH_DETAIL"] = res.detail
-
+ 
             # Reorder columns: insert meta cols right after hs_col
             cols = list(df.columns)
             # remove meta cols from current order
