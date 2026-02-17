@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+.streamlit/secrets.toml
+
+# Excel / data
+*.xlsx
+*.xlsm
+
+# OS
+.DS_Store
