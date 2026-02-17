@@ -355,3 +355,4 @@ if input_file and bdd_file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
+    st.info("Charge l’Excel à compléter + la BDD, puis lance le traitement.")
