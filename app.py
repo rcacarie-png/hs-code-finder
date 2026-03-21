@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -7,7 +8,22 @@ from typing import Optional, Dict, Tuple, List, Any
 import pandas as pd
 import streamlit as st
 from rapidfuzz import process, fuzz
-import requests
+
+
+# ----------------------------
+# Configuration
+# ----------------------------
+BDD_CLUBMED_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "clubmed_bdd.xlsx")
+TARIF_DOUANIER_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "tarifdouanier_2026_clean.csv")
+
+# Seuils pour fuzzy matching contre tarif douanier (style différent des descriptions Club Med)
+TARIF_AUTO_THRESHOLD = 85
+TARIF_REVIEW_THRESHOLD = 70
+
+# Seuils pour fuzzy matching BDD Club Med
+AUTO_FILL_THRESHOLD = 95
+REVIEW_THRESHOLD = 90
+MARGIN_TOP2 = 8
 
 
 # ----------------------------
@@ -81,128 +97,13 @@ def is_apparel_label(label: str) -> bool:
     return any(k in t for k in apparel_kw)
 
 
-# ----------------------------
-# WEB sanity check (anti-absurde)
-# ----------------------------
-def is_food_like_label(label: str) -> bool:
-    t = normalize_text(label)
-    food_kw = [
-        "OEUF", "OEUFS", "VOLAILLE", "POISSON", "VIANDE", "FROMAGE", "LAIT", "BEURRE",
-        "BOISSON", "VIN", "BIERE", "EAU", "CHOCOLAT", "SUCRE", "FARINE", "RIZ", "PATES",
-        "FRUIT", "LEGUME", "CONSERVE", "SAUCE", "EPICE", "THE", "CAFE"
-    ]
-    return any(k in t for k in food_kw)
-
-
-def hs_chapter(hs: str) -> str:
-    digits = re.sub(r"\D", "", safe_str(hs))
-    return digits[:2] if len(digits) >= 2 else ""
-
-
-def block_web_if_obviously_wrong(label: str, hs: str) -> bool:
-    """
-    Block only obvious wrong suggestions:
-    - If suggested HS is in food chapters (01..24) but label doesn't look like food.
-    """
-    ch = hs_chapter(hs)
-    if ch and ("01" <= ch <= "24") and (not is_food_like_label(label)):
-        return True
-    return False
-
-
-# ----------------------------
-# TarifDouanier API lookup (WEB)
-# ----------------------------
-def _extract_cn_candidates(api_data: Any) -> List[Tuple[str, str]]:
-    candidates: List[Tuple[str, str]] = []
-    if api_data is None:
-        return candidates
-
-    if isinstance(api_data, dict):
-        for key in ["items", "results", "data", "suggestions"]:
-            if key in api_data and isinstance(api_data[key], list):
-                api_data = api_data[key]
-                break
-
-    if not isinstance(api_data, list):
-        return candidates
-
-    for item in api_data:
-        if not isinstance(item, dict):
-            continue
-
-        code = (
-            item.get("cn")
-            or item.get("code")
-            or item.get("tariffNumber")
-            or item.get("number")
-            or item.get("value")
-            or item.get("id")
-        )
-
-        label = (
-            item.get("label")
-            or item.get("text")
-            or item.get("description")
-            or item.get("desc")
-            or item.get("name")
-            or ""
-        )
-
-        if code:
-            code_str = str(code).strip()
-            code_digits = re.sub(r"\D", "", code_str)
-            if len(code_digits) >= 6:
-                candidates.append((code_digits[:6], str(label).strip()))
-            else:
-                if code_str.isdigit() and len(code_str) >= 6:
-                    candidates.append((code_str[:6], str(label).strip()))
-
-    return candidates
-
-
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
-def lookup_hs_via_tarifdouanier_api(term: str, year: int = 2024, lang: str = "fr") -> Optional[Tuple[str, str]]:
-    term_n = normalize_text(term)
-    if not term_n:
-        return None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-    }
-
-    try:
-        url_v1 = "https://www.tarifdouanier.eu/api/v1/cnSuggest"
-        r = requests.get(url_v1, params={"term": term_n, "lang": lang, "year": str(year)}, headers=headers, timeout=15)
-        if r.ok:
-            data = r.json()
-            cands = _extract_cn_candidates(data)
-            if cands:
-                return cands[0]
-    except Exception:
-        pass
-
-    try:
-        url_v2 = "https://www.tarifdouanier.eu/api/v2/cnSuggest"
-        r = requests.get(url_v2, params={"term": term_n, "lang": lang}, headers=headers, timeout=15)
-        if r.ok:
-            data = r.json()
-            cands = _extract_cn_candidates(data)
-            if cands:
-                return cands[0]
-    except Exception:
-        pass
-
-    return None
-
 
 # ----------------------------
 # Matching engine
 # ----------------------------
 @dataclass
 class MatchResult:
-    hs_code: Optional[str]   # also written in HS column for REVIEW/WEB*
+    hs_code: Optional[str]
     match_type: str
     source: str
     detail: str
@@ -226,6 +127,53 @@ def load_bdd_single(bdd_file_bytes: bytes, file_label: str) -> pd.DataFrame:
     df["_SRC_FILE"] = file_label  # BDD_1 or BDD_2
     df = df.fillna("")
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_bdd_bundled(path: str) -> Optional[pd.DataFrame]:
+    """Load bundled BDD from local file (Club Med database).
+    
+    Supports .xlsx and .xlsm files via openpyxl engine.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return load_bdd_single(f.read(), file_label="BDD_CLUBMED")
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def load_tarif_douanier(path: str) -> Optional[pd.DataFrame]:
+    """Load bundled tariff database (CSV format)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, dtype=str)
+        if df is not None and not df.empty:
+            # Normaliser les colonnes pour l'indexation
+            df["_DESC_N"] = df["DESCRIPTION"].map(normalize_text)
+            df["_HS"] = df["HS_CODE"].map(lambda x: re.sub(r"\D", "", str(x))[:6])
+            
+            # Filtrer les lignes avec HS codes valides (au moins 6 chiffres)
+            df = df[df["_HS"].str.len() >= 6].copy()
+            
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def load_tarif_with_indexes(path: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, str]], Optional[List[str]]]:
+    """Load tariff database and build indexes."""
+    df = load_tarif_douanier(path)
+    if df is None:
+        print("load_tarif_with_indexes: df is None")
+        return None, None, None
+    
+    desc_to_hs, desc_list = build_tarif_indexes(df)
+    print(f"load_tarif_with_indexes: built indexes with {len(desc_list)} descriptions")
+    return df, desc_to_hs, desc_list
 
 
 def load_and_merge_bdds(bdd1_bytes: bytes, bdd2_bytes: Optional[bytes], bdd2_enabled: bool) -> pd.DataFrame:
@@ -276,6 +224,23 @@ def build_bdd_indexes(bdd: pd.DataFrame):
     return code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list
 
 
+def build_tarif_indexes(tarif_df: pd.DataFrame):
+    """Build indexes for tariff database using normalized columns."""
+    desc_to_hs: Dict[str, str] = {}
+    desc_list: List[str] = []
+
+    for _, row in tarif_df.iterrows():
+        desc = safe_str(row.get("_DESC_N", ""))
+        hs = safe_str(row.get("_HS", ""))
+
+        if desc and hs:
+            desc_list.append(desc)
+            if desc not in desc_to_hs:
+                desc_to_hs[desc] = hs
+
+    return desc_to_hs, desc_list
+
+
 def fuzzy_best_two(query: str, choices: List[str]):
     if not query or not choices:
         return None, None
@@ -294,11 +259,11 @@ def match_row(
     libelle: str,
     fournisseur: str,
     indexes,
+    tarif_desc_to_hs: Optional[Dict[str, str]],
+    tarif_desc_list: Optional[List[str]],
     auto_fill_threshold: int,
     review_threshold: int,
-    margin_top2: int,
-    enable_web: bool,
-    web_year: int
+    margin_top2: int
 ) -> MatchResult:
     code_to_best, desc_to_best, desc_list, supp_code_to_best, supp_desc_to_best, supp_desc_list = indexes
 
@@ -383,25 +348,7 @@ def match_row(
                     )
 
             else:
-                # Fuzzy matched but HS missing in BDD -> try web suggestion
-                if enable_web and libelle:
-                    web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
-                    if web:
-                        hs_web, label = web
-                        if block_web_if_obviously_wrong(libelle, hs_web):
-                            return MatchResult(
-                                hs_web,
-                                "WEB_BLOCKED",
-                                "WEB_API",
-                                f'web suggestion blocked (obvious mismatch); label="{label[:140]}"; year={web_year}'
-                            )
-                        return MatchResult(
-                            hs_web,
-                            "WEB_REVIEW",
-                            "WEB_API",
-                            f'web suggestion; label="{label[:140]}"; year={web_year}'
-                        )
-
+                # Fuzzy matched but HS missing in BDD
                 return MatchResult(
                     None,
                     "FOUND_NO_HS_IN_BDD",
@@ -409,24 +356,35 @@ def match_row(
                     f'fuzzy matched but HS missing in BDD; score={best_score}; matched="{best_desc[:120]}"'
                 )
 
-    # 4) Web fallback
-    if enable_web and libelle:
-        web = lookup_hs_via_tarifdouanier_api(libelle, year=web_year, lang="fr")
-        if web:
-            hs_web, label = web
-            if block_web_if_obviously_wrong(libelle, hs_web):
-                return MatchResult(
-                    hs_web,
-                    "WEB_BLOCKED",
-                    "WEB_API",
-                    f'web suggestion blocked (obvious mismatch); label="{label[:140]}"; year={web_year}'
-                )
-            return MatchResult(
-                hs_web,
-                "WEB_REVIEW",
-                "WEB_API",
-                f'web suggestion; label="{label[:140]}"; year={web_year}'
-            )
+    # 4) Fuzzy matching against Tarif Douanier if no match in BDD
+    if lib_n and tarif_desc_list and tarif_desc_to_hs:
+        print(f"TARIF FALLBACK called: lib_n={lib_n}, tarif_list_size={len(tarif_desc_list)}")
+        best, second = fuzzy_best_two(lib_n, tarif_desc_list)
+        if best:
+            best_desc, best_score = best
+            second_score = second[1] if second else 0
+            margin = best_score - second_score
+
+            hs = tarif_desc_to_hs.get(best_desc)
+            if hs:
+                # Auto-fill when confident (lower thresholds for tarif due to style differences)
+                if best_score >= TARIF_AUTO_THRESHOLD and margin >= mg:
+                    return MatchResult(
+                        hs,
+                        "FUZZY",
+                        "TARIF",
+                        f'fuzzy(tarif) AUTO; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                    )
+
+                # REVIEW (uncertain) -> still write suggested HS in HS column
+                # Require minimum margin of 5 to avoid false positives
+                if best_score >= TARIF_REVIEW_THRESHOLD and margin >= 5:
+                    return MatchResult(
+                        hs,
+                        "REVIEW",
+                        "TARIF",
+                        f'fuzzy(tarif) REVIEW; score={best_score}; top2_margin={margin}; matched="{best_desc[:120]}"'
+                    )
 
     return MatchResult(None, "NOT_FOUND", "NONE", "no match")
 
@@ -434,17 +392,14 @@ def match_row(
 def process_workbook(
     input_bytes: bytes,
     input_name: str,
-    bdd1_bytes: bytes,
-    bdd2_bytes: Optional[bytes],
-    bdd2_enabled: bool,
+    bdd: pd.DataFrame,
+    tarif_desc_to_hs: Optional[Dict[str, str]],
+    tarif_desc_list: Optional[List[str]],
     auto_fill_threshold: int,
     review_threshold: int,
-    margin_top2: int,
-    enable_web: bool,
-    web_year: int
+    margin_top2: int
 ) -> bytes:
-    # Load/merge BDD
-    bdd = load_and_merge_bdds(bdd1_bytes, bdd2_bytes, bdd2_enabled)
+    # Use provided BDD
     indexes = build_bdd_indexes(bdd)
 
     # Choose engine for INPUT workbook based on extension
@@ -477,6 +432,8 @@ def process_workbook(
                 if mc not in df.columns:
                     df[mc] = ""
 
+            print(f"tarif_desc_list size: {len(tarif_desc_list) if tarif_desc_list else 'None'}")
+
             for i in range(len(df)):
                 current_hs = safe_str(df.at[i, hs_col]) if i in df.index else ""
                 if current_hs:
@@ -494,11 +451,11 @@ def process_workbook(
                     libelle=lib_val,
                     fournisseur=supp_val,
                     indexes=indexes,
+                    tarif_desc_to_hs=tarif_desc_to_hs,
+                    tarif_desc_list=tarif_desc_list,
                     auto_fill_threshold=auto_fill_threshold,
                     review_threshold=review_threshold,
-                    margin_top2=margin_top2,
-                    enable_web=enable_web,
-                    web_year=web_year
+                    margin_top2=margin_top2
                 )
 
                 # Write HS if suggested or exact (your current behavior)
@@ -529,55 +486,76 @@ def process_workbook(
 # ----------------------------
 st.set_page_config(page_title="HS Code Finder", layout="wide")
 st.title("HS Code Finder")
-st.caption("Compléter automatiquement la colonne HS Code à partir d’1 ou 2 fichiers historiques, avec suggestions en cas d’incertitude.")
+st.caption("Compléter automatiquement la colonne HS Code à partir de la BDD Club Med chargée.")
 
-col1, col2, col3 = st.columns(3)
+# Load bundled BDD at startup
+bdd_clubmed = load_bdd_bundled(BDD_CLUBMED_PATH)
+tarif_douanier, tarif_desc_to_hs, tarif_desc_list = load_tarif_with_indexes(TARIF_DOUANIER_PATH)
+
+print(f"Loaded tarif_desc_list size: {len(tarif_desc_list) if tarif_desc_list else 'None'}")
+
+# Sidebar: Sources bundlées et ordre de priorité
+with st.sidebar:
+    st.header("📚 Sources de données")
+    
+    # BDD Club Med status
+    st.subheader("1️⃣ BDD Club Med")
+    if bdd_clubmed is not None and not bdd_clubmed.empty:
+        st.success(f"✅ Chargée: {len(bdd_clubmed)} lignes")
+    else:
+        st.error(f"❌ Introuvable ou vide")
+    
+    # Tarif Douanier status
+    st.subheader("2️⃣ Data tarifdouanier.eu")
+    if tarif_douanier is not None and not tarif_douanier.empty:
+        st.success(f"✅ Chargée: {len(tarif_douanier)} lignes")
+    else:
+        st.error(f"❌ Introuvable ou vide")
+    
+    st.divider()
+    
+    # Ordre de priorité
+    st.subheader("🔍 Ordre de priorité")
+    st.markdown("""
+    1. **Code article exact** (BDD Club Med)
+    2. **Description exacte** (BDD Club Med)
+    3. **Fuzzy matching** (BDD Club Med)
+       - AUTO si score >= seuil
+       - REVIEW si incertain
+    4. **Tarif fuzzy** (Data tarifdouanier.eu)
+    5. **NOT_FOUND**
+    """)
+
+col1 = st.columns(1)[0]
 with col1:
     input_file = st.file_uploader(
         "Excel à compléter (multi-onglets)",
-        type=["xls", "xlsx", "xlsm"]  # ✅ extended
+        type=["xls", "xlsx", "xlsm"]
     )
-with col2:
-    bdd1_file = st.file_uploader("BDD source #1", type=["xlsx", "xlsm", "xls"])
-with col3:
-    bdd2_file = st.file_uploader("BDD source #2 (optionnel)", type=["xlsx", "xlsm", "xls"])
-bdd2_enabled = bdd2_file is not None
 
 st.divider()
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    auto_fill_threshold = st.slider("Seuil AUTO-FILL (remplissage automatique)", 80, 99, 95, 1)
-with c2:
-    review_threshold = st.slider("Seuil REVIEW (suggestion)", 60, 98, 90, 1)
-with c3:
-    margin_top2 = st.slider("Marge Top1 vs Top2 (anti-faux positifs)", 0, 20, 8, 1)
-
-enable_web = st.checkbox("Activer la recherche web (suggestions)", value=True)
-web_year = st.selectbox("Année tarif", options=[2024, 2025, 2026], index=2)
-
 st.caption(
-    "Lecture des résultats : EXACT/FUZZY = rempli automatiquement. "
-    "REVIEW/WEB_REVIEW/WEB_BLOCKED = HS écrit mais à valider. "
-    "NOT_FOUND = aucune piste. "
-    "Amélioration textile : seuils automatiquement plus stricts si le libellé ressemble à un vêtement."
+    "Résultats : EXACT = code/description exacte (auto-rempli). "
+    "FUZZY AUTO = match confiant (auto-rempli). "
+    "REVIEW = match incertain à valider. "
+    "TARIF_FUZZY = suggestion tarifaire à valider. "
+    "NOT_FOUND = aucune correspondance."
 )
 
-if input_file and bdd1_file:
-    st.success("Fichiers chargés.")
+if input_file and bdd_clubmed is not None and not bdd_clubmed.empty:
+    st.success("Fichiers prêts.")
     if st.button("🚀 Enrichir et générer l’Excel", type="primary"):
         with st.spinner("Traitement…"):
             out_bytes = process_workbook(
                 input_bytes=input_file.read(),
-                input_name=input_file.name,  # ✅ needed to choose xls vs xlsx/xlsm
-                bdd1_bytes=bdd1_file.read(),
-                bdd2_bytes=bdd2_file.read() if bdd2_enabled else None,
-                bdd2_enabled=bdd2_enabled,
-                auto_fill_threshold=auto_fill_threshold,
-                review_threshold=review_threshold,
-                margin_top2=margin_top2,
-                enable_web=enable_web,
-                web_year=web_year
+                input_name=input_file.name,
+                bdd=bdd_clubmed,
+                tarif_desc_to_hs=tarif_desc_to_hs,
+                tarif_desc_list=tarif_desc_list,
+                auto_fill_threshold=AUTO_FILL_THRESHOLD,
+                review_threshold=REVIEW_THRESHOLD,
+                margin_top2=MARGIN_TOP2
             )
 
         st.download_button(
@@ -586,5 +564,7 @@ if input_file and bdd1_file:
             file_name="excel_hs_enrichi.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+elif not input_file:
+    st.info("Charge l'Excel à compléter.")
 else:
-    st.info("Charge l’Excel à compléter + au moins la BDD source #1.")
+    st.error("La BDD Club Med n'est pas chargée. Vérifiez que le fichier existe.")
