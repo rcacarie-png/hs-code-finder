@@ -13,7 +13,7 @@ from rapidfuzz import process, fuzz
 # ----------------------------
 # Configuration
 # ----------------------------
-BDD_CLUBMED_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "clubmed_bdd.xlsx")
+BDD_CLUBMED_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "clubmed_bdd.xlsm")
 TARIF_DOUANIER_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "tarifdouanier_2026_clean.csv")
 
 # Seuils pour fuzzy matching contre tarif douanier (style différent des descriptions Club Med)
@@ -24,6 +24,11 @@ TARIF_REVIEW_THRESHOLD = 70
 AUTO_FILL_THRESHOLD = 95
 REVIEW_THRESHOLD = 90
 MARGIN_TOP2 = 8
+
+# GitHub configuration
+GITHUB_OWNER = "rcacarie-png"
+GITHUB_REPO = "hs-code-finder"
+GITHUB_BDD_PATH = "data/processed/clubmed_bdd.xlsm"
 
 
 # ----------------------------
@@ -168,11 +173,9 @@ def load_tarif_with_indexes(path: str) -> Tuple[Optional[pd.DataFrame], Optional
     """Load tariff database and build indexes."""
     df = load_tarif_douanier(path)
     if df is None:
-        print("load_tarif_with_indexes: df is None")
         return None, None, None
     
     desc_to_hs, desc_list = build_tarif_indexes(df)
-    print(f"load_tarif_with_indexes: built indexes with {len(desc_list)} descriptions")
     return df, desc_to_hs, desc_list
 
 
@@ -358,7 +361,6 @@ def match_row(
 
     # 4) Fuzzy matching against Tarif Douanier if no match in BDD
     if lib_n and tarif_desc_list and tarif_desc_to_hs:
-        print(f"TARIF FALLBACK called: lib_n={lib_n}, tarif_list_size={len(tarif_desc_list)}")
         best, second = fuzzy_best_two(lib_n, tarif_desc_list)
         if best:
             best_desc, best_score = best
@@ -432,8 +434,6 @@ def process_workbook(
                 if mc not in df.columns:
                     df[mc] = ""
 
-            print(f"tarif_desc_list size: {len(tarif_desc_list) if tarif_desc_list else 'None'}")
-
             for i in range(len(df)):
                 current_hs = safe_str(df.at[i, hs_col]) if i in df.index else ""
                 if current_hs:
@@ -481,6 +481,138 @@ def process_workbook(
     return out_buffer.getvalue()
 
 
+def enrich_and_push_bdd(enrich_file_bytes: bytes, enrich_file_name: str) -> int:
+    """Enrich BDD with new lines from uploaded file and push to GitHub.
+    Returns: number of new lines added, or -1 on error."""
+    import base64
+    import requests
+    
+    try:
+        # Check for GitHub token
+        if "GITHUB_TOKEN" not in st.secrets:
+            st.warning("⚠️ GITHUB_TOKEN non configuré dans les secrets Streamlit.")
+            return -1
+        
+        github_token = st.secrets["GITHUB_TOKEN"]
+        
+        # Read enriched file
+        ext = get_ext(enrich_file_name)
+        if ext == "xls":
+            enrich_df = pd.read_excel(io.BytesIO(enrich_file_bytes), sheet_name=0, engine="xlrd")
+        else:
+            enrich_df = pd.read_excel(io.BytesIO(enrich_file_bytes), sheet_name=0, engine="openpyxl")
+        
+        enrich_df.columns = [str(c).strip() for c in enrich_df.columns]
+        
+        # 1. Détecter la colonne HS code
+        hs_col = find_hs_col(enrich_df)
+        if not hs_col:
+            st.error("❌ Colonne HS CODE non trouvée dans le fichier.")
+            return -1
+        
+        # 2. Détecter la colonne code article
+        code_col = find_col(enrich_df, ["CODE ARTICLE", "Article", "CODE_ARTICLE"])
+        if not code_col:
+            st.warning("⚠️ Colonne CODE ARTICLE non trouvée, utilisation de valeurs vides.")
+        
+        # 3. Détecter la colonne description
+        desc_col = find_col(enrich_df, ["Description", "Libellé à imprimer", "Libelle a imprimer", "DESIGNATION"])
+        if not desc_col:
+            st.warning("⚠️ Colonne Description non trouvée, utilisation de valeurs vides.")
+        
+        # 4. Garder uniquement les lignes où HS code est non vide
+        enrich_df = enrich_df[
+            enrich_df[hs_col].notna() & 
+            (enrich_df[hs_col].astype(str).str.strip() != "") &
+            (enrich_df[hs_col].astype(str).str.lower() != "nan")
+        ].copy()
+        
+        if enrich_df.empty:
+            st.warning("⚠️ Aucune ligne avec HS code rempli trouvée.")
+            return 0
+        
+        # 5. Construire un DataFrame avec exactement ces colonnes pour correspondre à la BDD Club Med
+        new_rows = []
+        for _, row in enrich_df.iterrows():
+            new_row = {
+                "FOURNISSEUR": "",  # Laisser vide si colonne absente
+                "CODE ARTICLE": safe_str(row.get(code_col, "")) if code_col else "",
+                "Description": safe_str(row.get(desc_col, "")) if desc_col else "",
+                "HS CODE": safe_str(row[hs_col])
+            }
+            new_rows.append(new_row)
+        
+        enrich_df_clean = pd.DataFrame(new_rows)
+        
+        # Charger la BDD existante
+        existing_bdd = pd.read_excel(BDD_CLUBMED_PATH, sheet_name=0, engine="openpyxl")
+        
+        # 6. Concaténer avec la BDD existante et dédupliquer sur (CODE ARTICLE, HS CODE) en ignorant les valeurs vides
+        combined_df = pd.concat([existing_bdd, enrich_df_clean], ignore_index=True)
+        
+        # Créer une clé de déduplication qui ignore les lignes où CODE ARTICLE ou HS CODE sont vides
+        combined_df["_DEDUP_KEY"] = combined_df.apply(
+            lambda row: f"{safe_str(row['CODE ARTICLE'])}|{safe_str(row['HS CODE'])}" 
+            if safe_str(row['CODE ARTICLE']) and safe_str(row['HS CODE']) 
+            else None, 
+            axis=1
+        )
+        
+        # Garder seulement les lignes avec une clé valide et dédupliquer
+        combined_df = combined_df[combined_df["_DEDUP_KEY"].notna()]
+        combined_df = combined_df.drop_duplicates(subset=["_DEDUP_KEY"], keep="first")
+        combined_df = combined_df.drop(columns=["_DEDUP_KEY"])
+        
+        # Calculer le nombre de nouvelles lignes ajoutées
+        new_count = len(enrich_df_clean)
+        
+        # Save to buffer
+        out_buffer = io.BytesIO()
+        with pd.ExcelWriter(out_buffer, engine="openpyxl") as writer:
+            combined_df.to_excel(writer, sheet_name="BDD", index=False)
+        out_buffer.seek(0)
+        bdd_bytes = out_buffer.getvalue()
+        
+        # Get current file SHA
+        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_BDD_PATH}"
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"token {github_token}",
+        }
+        
+        resp_get = requests.get(url, headers=headers)
+        if resp_get.status_code == 200:
+            current_sha = resp_get.json().get("sha")
+        elif resp_get.status_code == 404:
+            current_sha = None
+        else:
+            st.error(f"❌ Erreur GitHub GET: {resp_get.status_code} - {resp_get.text}")
+            return -1
+        
+        # Push updated file
+        bdd_base64 = base64.b64encode(bdd_bytes).decode("utf-8")
+        payload = {
+            "message": f"BDD enrichie automatiquement - {new_count} nouv. lignes",
+            "content": bdd_base64,
+        }
+        if current_sha:
+            payload["sha"] = current_sha
+        
+        resp_put = requests.put(url, json=payload, headers=headers)
+        if resp_put.status_code not in [200, 201]:
+            st.error(f"❌ Erreur GitHub PUT: {resp_put.status_code} - {resp_put.text}")
+            return -1
+        
+        # Clear cache for next load
+        st.cache_data.clear()
+        
+        return max(0, new_count)
+    
+    except Exception as e:
+        st.error(f"❌ Erreur: {str(e)}")
+        return -1
+
+
 # ----------------------------
 # Streamlit UI (clean)
 # ----------------------------
@@ -491,8 +623,6 @@ st.caption("Compléter automatiquement la colonne HS Code à partir de la BDD Cl
 # Load bundled BDD at startup
 bdd_clubmed = load_bdd_bundled(BDD_CLUBMED_PATH)
 tarif_douanier, tarif_desc_to_hs, tarif_desc_list = load_tarif_with_indexes(TARIF_DOUANIER_PATH)
-
-print(f"Loaded tarif_desc_list size: {len(tarif_desc_list) if tarif_desc_list else 'None'}")
 
 # Sidebar: Sources bundlées et ordre de priorité
 with st.sidebar:
@@ -568,3 +698,26 @@ elif not input_file:
     st.info("Charge l'Excel à compléter.")
 else:
     st.error("La BDD Club Med n'est pas chargée. Vérifiez que le fichier existe.")
+# ----------------------------
+# Section: Enrichir la BDD
+# ----------------------------
+st.divider()
+st.subheader("📥 Enrichir la BDD")
+st.caption("Uploadez un fichier Excel complété manuellement pour enrichir automatiquement la BDD Club Med.")
+
+enrich_file = st.file_uploader(
+    "Fichier Excel complété",
+    type=["xls", "xlsx", "xlsm"],
+    key="enrich_uploader"
+)
+
+if enrich_file:
+    if st.button("Intégrer dans la BDD", type="primary"):
+        with st.spinner("Intégration en cours…"):
+            new_count = enrich_and_push_bdd(enrich_file.read(), enrich_file.name)
+            if new_count > 0:
+                st.success(f"✅ BDD enrichie : {new_count} nouvelles lignes ajoutées.")
+                st.balloons()
+                st.rerun()
+            elif new_count == 0:
+                st.info("✅ Aucune nouvelle ligne à ajouter (doublons détectés).")
