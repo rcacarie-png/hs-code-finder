@@ -13,7 +13,7 @@ from rapidfuzz import process, fuzz
 # ----------------------------
 # Configuration
 # ----------------------------
-BDD_CLUBMED_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "clubmed_bdd.xlsm")
+BDD_CLUBMED_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "clubmed_bdd.xlsx")
 TARIF_DOUANIER_PATH = os.path.join(os.path.dirname(__file__), "data", "processed", "tarifdouanier_2026_clean.csv")
 
 # Seuils pour fuzzy matching contre tarif douanier (style différent des descriptions Club Med)
@@ -28,7 +28,7 @@ MARGIN_TOP2 = 8
 # GitHub configuration
 GITHUB_OWNER = "rcacarie-png"
 GITHUB_REPO = "hs-code-finder"
-GITHUB_BDD_PATH = "data/processed/clubmed_bdd.xlsm"
+GITHUB_BDD_PATH = "data/processed/clubmed_bdd.xlsx"
 
 
 # ----------------------------
