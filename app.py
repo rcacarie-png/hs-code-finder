@@ -413,94 +413,102 @@ def process_workbook(
         # xlsx/xlsm
         xls = pd.ExcelFile(io.BytesIO(input_bytes), engine="openpyxl")
 
-    out_buffer = io.BytesIO()
+    # Construire le workbook openpyxl directement, sans passer par pd.ExcelWriter
+    # Cela évite le bug "At least one sheet must be visible" sur openpyxl récent (Python 3.13)
+    # causé par le context manager __exit__ qui tente de sauvegarder un workbook en état invalide.
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
 
-    # Output always xlsx
-    with pd.ExcelWriter(out_buffer, engine="openpyxl") as writer:
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name)
+    wb_out = Workbook()
+    wb_out.remove(wb_out.active)  # Supprimer la sheet vide par défaut
 
-            hs_col = find_hs_col(df)
-            if hs_col is None:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+
+        hs_col = find_hs_col(df)
+        if hs_col is None:
+            # Onglet sans colonne HS : copie directe
+            ws = wb_out.create_sheet(title=sheet_name)
+            for row in dataframe_to_rows(df, index=False, header=True):
+                ws.append(row)
+            continue
+
+        article_col = find_col(df, ["Article", "CODE ARTICLE", "Code article"])
+        lib_col = find_col(df, ["Libellé à imprimer", "Libelle a imprimer", "Description", "Libellé", "Libelle"])
+        supp_col = find_col(df, ["Fournisseur", "Supplier", "FOURNISSEUR"])
+
+        meta_cols = ["HS_MATCH_TYPE", "HS_SOURCE", "HS_MATCH_DETAIL"]
+        for mc in meta_cols:
+            if mc not in df.columns:
+                df[mc] = ""
+
+        for i in range(len(df)):
+            try:
+                current_hs = safe_str(df.at[i, hs_col])
+            except (KeyError, IndexError):
+                current_hs = ""
+
+            if current_hs:
+                df.at[i, "HS_MATCH_TYPE"] = "ALREADY_PRESENT"
+                df.at[i, "HS_SOURCE"] = "INPUT"
+                df.at[i, "HS_MATCH_DETAIL"] = "HS already filled in input file"
                 continue
 
-            article_col = find_col(df, ["Article", "CODE ARTICLE", "Code article"])
-            lib_col = find_col(df, ["Libellé à imprimer", "Libelle a imprimer", "Description", "Libellé", "Libelle"])
-            supp_col = find_col(df, ["Fournisseur", "Supplier", "FOURNISSEUR"])
+            try:
+                article_val = safe_str(df.at[i, article_col]) if article_col else ""
+            except (KeyError, IndexError):
+                article_val = ""
+            try:
+                lib_val = safe_str(df.at[i, lib_col]) if lib_col else ""
+            except (KeyError, IndexError):
+                lib_val = ""
+            try:
+                supp_val = safe_str(df.at[i, supp_col]) if supp_col else ""
+            except (KeyError, IndexError):
+                supp_val = ""
 
-            meta_cols = ["HS_MATCH_TYPE", "HS_SOURCE", "HS_MATCH_DETAIL"]
-            for mc in meta_cols:
-                if mc not in df.columns:
-                    df[mc] = ""
+            res = match_row(
+                article_code=article_val,
+                libelle=lib_val,
+                fournisseur=supp_val,
+                indexes=indexes,
+                tarif_desc_to_hs=tarif_desc_to_hs,
+                tarif_desc_list=tarif_desc_list,
+                auto_fill_threshold=auto_fill_threshold,
+                review_threshold=review_threshold,
+                margin_top2=margin_top2
+            )
 
-            for i in range(len(df)):
-                # PATCH 1 : accès sécurisé à la valeur HS courante
-                try:
-                    current_hs = safe_str(df.at[i, hs_col])
-                except (KeyError, IndexError):
-                    current_hs = ""
+            hscode = safe_str(res.hs_code)
+            if hscode:
+                df.at[i, hs_col] = hscode
 
-                if current_hs:
-                    df.at[i, "HS_MATCH_TYPE"] = "ALREADY_PRESENT"
-                    df.at[i, "HS_SOURCE"] = "INPUT"
-                    df.at[i, "HS_MATCH_DETAIL"] = "HS already filled in input file"
-                    continue
+            df.at[i, "HS_MATCH_TYPE"] = res.match_type
+            df.at[i, "HS_SOURCE"] = res.source
+            df.at[i, "HS_MATCH_DETAIL"] = res.detail
 
-                # PATCH 2 : accès sécurisé aux colonnes optionnelles
-                try:
-                    article_val = safe_str(df.at[i, article_col]) if article_col else ""
-                except (KeyError, IndexError):
-                    article_val = ""
-                try:
-                    lib_val = safe_str(df.at[i, lib_col]) if lib_col else ""
-                except (KeyError, IndexError):
-                    lib_val = ""
-                try:
-                    supp_val = safe_str(df.at[i, supp_col]) if supp_col else ""
-                except (KeyError, IndexError):
-                    supp_val = ""
+        # Reorder: meta cols right after HS col
+        cols = list(df.columns)
+        for mc in meta_cols:
+            cols.remove(mc)
+        hs_idx = cols.index(hs_col)
+        new_cols = cols[:hs_idx + 1] + meta_cols + cols[hs_idx + 1:]
+        df = df[new_cols]
 
-                res = match_row(
-                    article_code=article_val,
-                    libelle=lib_val,
-                    fournisseur=supp_val,
-                    indexes=indexes,
-                    tarif_desc_to_hs=tarif_desc_to_hs,
-                    tarif_desc_list=tarif_desc_list,
-                    auto_fill_threshold=auto_fill_threshold,
-                    review_threshold=review_threshold,
-                    margin_top2=margin_top2
-                )
+        ws = wb_out.create_sheet(title=sheet_name)
+        for row in dataframe_to_rows(df, index=False, header=True):
+            ws.append(row)
 
-                # Write HS if suggested or exact
-                hscode = safe_str(res.hs_code)
-                if hscode:
-                    df.at[i, hs_col] = hscode
+    # Garantir qu'au moins un onglet est visible (sécurité finale)
+    if not wb_out.worksheets:
+        wb_out.create_sheet(title="Sheet1")
+    visible = [ws for ws in wb_out.worksheets if ws.sheet_state == "visible"]
+    if not visible:
+        wb_out.worksheets[0].sheet_state = "visible"
+    wb_out.active = wb_out.worksheets[0]
 
-                df.at[i, "HS_MATCH_TYPE"] = res.match_type
-                df.at[i, "HS_SOURCE"] = res.source
-                df.at[i, "HS_MATCH_DETAIL"] = res.detail
-
-            # Reorder: meta cols right after HS col
-            cols = list(df.columns)
-            for mc in meta_cols:
-                cols.remove(mc)
-            hs_idx = cols.index(hs_col)
-            new_cols = cols[:hs_idx + 1] + meta_cols + cols[hs_idx + 1:]
-            df = df[new_cols]
-
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-        # PATCH 3 : garantir qu'au moins un onglet est visible avant la sauvegarde
-        # Corrige le IndexError "At least one sheet must be visible" sur openpyxl récent (Python 3.13)
-        wb = writer.book
-        visible_sheets = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
-        if not visible_sheets and wb.worksheets:
-            wb.worksheets[0].sheet_state = "visible"
-        if wb.worksheets:
-            wb.active = wb.worksheets[0]
-
+    out_buffer = io.BytesIO()
+    wb_out.save(out_buffer)
     out_buffer.seek(0)
     return out_buffer.getvalue()
 
