@@ -442,6 +442,13 @@ def process_workbook(
             if mc not in df.columns:
                 df[mc] = ""
 
+        # PATCH dtype : forcer HS col + meta cols en object (string)
+        # pandas 3.x / Python 3.13 lève TypeError si on écrit une string
+        # dans une colonne inférée float64 (colonne vide = NaN = float64)
+        df[hs_col] = df[hs_col].astype(object)
+        for mc in meta_cols:
+            df[mc] = df[mc].astype(object)
+
         for i in range(len(df)):
             try:
                 current_hs = safe_str(df.at[i, hs_col])
