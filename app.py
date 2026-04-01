@@ -435,16 +435,31 @@ def process_workbook(
                     df[mc] = ""
 
             for i in range(len(df)):
-                current_hs = safe_str(df.at[i, hs_col]) if i in df.index else ""
+                # PATCH 1 : accès sécurisé à la valeur HS courante
+                try:
+                    current_hs = safe_str(df.at[i, hs_col])
+                except (KeyError, IndexError):
+                    current_hs = ""
+
                 if current_hs:
                     df.at[i, "HS_MATCH_TYPE"] = "ALREADY_PRESENT"
                     df.at[i, "HS_SOURCE"] = "INPUT"
                     df.at[i, "HS_MATCH_DETAIL"] = "HS already filled in input file"
                     continue
 
-                article_val = safe_str(df.at[i, article_col]) if article_col else ""
-                lib_val = safe_str(df.at[i, lib_col]) if lib_col else ""
-                supp_val = safe_str(df.at[i, supp_col]) if supp_col else ""
+                # PATCH 2 : accès sécurisé aux colonnes optionnelles
+                try:
+                    article_val = safe_str(df.at[i, article_col]) if article_col else ""
+                except (KeyError, IndexError):
+                    article_val = ""
+                try:
+                    lib_val = safe_str(df.at[i, lib_col]) if lib_col else ""
+                except (KeyError, IndexError):
+                    lib_val = ""
+                try:
+                    supp_val = safe_str(df.at[i, supp_col]) if supp_col else ""
+                except (KeyError, IndexError):
+                    supp_val = ""
 
                 res = match_row(
                     article_code=article_val,
@@ -458,7 +473,7 @@ def process_workbook(
                     margin_top2=margin_top2
                 )
 
-                # Write HS if suggested or exact (your current behavior)
+                # Write HS if suggested or exact
                 hscode = safe_str(res.hs_code)
                 if hscode:
                     df.at[i, hs_col] = hscode
@@ -476,6 +491,15 @@ def process_workbook(
             df = df[new_cols]
 
             df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # PATCH 3 : garantir qu'au moins un onglet est visible avant la sauvegarde
+        # Corrige le IndexError "At least one sheet must be visible" sur openpyxl récent (Python 3.13)
+        wb = writer.book
+        visible_sheets = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
+        if not visible_sheets and wb.worksheets:
+            wb.worksheets[0].sheet_state = "visible"
+        if wb.worksheets:
+            wb.active = wb.worksheets[0]
 
     out_buffer.seek(0)
     return out_buffer.getvalue()
@@ -675,7 +699,7 @@ st.caption(
 
 if input_file and bdd_clubmed is not None and not bdd_clubmed.empty:
     st.success("Fichiers prêts.")
-    if st.button("🚀 Enrichir et générer l’Excel", type="primary"):
+    if st.button("🚀 Enrichir et générer l'Excel", type="primary"):
         with st.spinner("Traitement…"):
             out_bytes = process_workbook(
                 input_bytes=input_file.read(),
@@ -689,7 +713,7 @@ if input_file and bdd_clubmed is not None and not bdd_clubmed.empty:
             )
 
         st.download_button(
-            label="⬇️ Télécharger l’Excel enrichi",
+            label="⬇️ Télécharger l'Excel enrichi",
             data=out_bytes,
             file_name="excel_hs_enrichi.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
